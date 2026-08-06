@@ -1,0 +1,49 @@
+# Example llmbench config. CLI flags override any value set here.
+# See docs/contract.md for the measurement contract this config is scoped to satisfy,
+# and docs/reference-notes.md for the source citations behind every default below.
+
+url: http://127.0.0.1:8080
+backend: auto            # auto | llamacpp | vllm
+measure: both             # client | server | both
+server_mode: attach       # attach | manage
+
+model:
+  - qwen2.5-0.5b-instruct
+
+# Group 1 -- request-shaping. Range syntax (first-last, first-last+step, first-last*mult) and
+# comma-separated lists both accepted, replicated from llama-bench's parse_int_range().
+n_prompt: [512]
+n_gen: [128]
+n_depth: [0]
+reps: 5
+concurrency: [1]
+shared_prefix: [0]
+delay: 0.0
+
+# Convergence warmup (course_correct.txt §2.9) -- leave both unset for the default
+# convergence loop (k=5, 2% rolling-stddev threshold, hard cap 50).
+# no_warmup: false
+# warmup_fixed: null   # set an integer for llama-bench-comparable fixed warmup
+
+# Open-loop arrivals (spec §4.6) -- leave request_rate unset for closed-loop -c behavior.
+# request_rate: 5.0
+# burstiness: 1.0
+
+# Group 2 -- server-side (fixed at launch). In --server-mode attach, more than one value
+# for any of these is an error (llmbench verifies against /props and errors on mismatch).
+ngl: [-1]
+flash_attn: [auto]
+ctk: [f16]
+ctv: [f16]
+batch: [2048]
+ubatch: [512]
+threads: [-1]
+n_parallel: [-1]
+n_ctx: [0]
+
+output: md                # csv | json | jsonl | md | md-llamabench | sql
+out_dir: out
+tag: null
+
+# Required for any cross-backend comparison run (course_correct.txt §3) -- no default.
+# parity_mode: weights     # weights | native

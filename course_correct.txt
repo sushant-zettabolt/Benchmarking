@@ -1,0 +1,203 @@
+# `llmbench` — Course correction: from format parity to measurement parity
+
+**Read this before writing more code.** It changes the north star of the project. Most of the existing code survives; the framing, the acceptance criteria, and one core module do not.
+
+---
+
+## 0. The premise that was wrong
+
+The original spec told you to reproduce `llama-bench`'s numbers and output format over HTTP, and to bolt vLLM onto the side. That was backwards, for a reason that matters:
+
+**`llama-bench` and `vllm bench serve` do not measure the same thing, and neither is a valid target for a cross-backend tool.**
+
+- `llama-bench` links `libllama` and times `llama_decode()` in-process. No server, no scheduler, no admission, no HTTP, no sampling, no tokenization. It measures a *decode-shape ceiling* for one sequence.
+- `vllm bench serve` drives an open-loop arrival process against an HTTP server and measures client-observed TTFT/TPOT/ITL through the full continuous-batching scheduler.
+- vLLM has **no** equivalent of llama-bench, because vLLM has exactly one execution path and it always goes through the scheduler. There is no "just the decode loop" to time.
+
+So "match llama-bench within 5%" was an acceptance criterion that only one of the two backends can even be scored against. Matching it makes the tool a llama.cpp instrument with a vLLM adapter — which is the thing we are trying not to build.
+
+### The new north star
+
+> Define **one measurement contract**. Implement it **identically** for both backends. Prove, before every run, that both systems are in **equivalent initial conditions**. Use `llama-bench` and `vllm bench serve` as **calibration anchors** that bound and explain our numbers — never as targets to match.
+
+Surface-level output parity (llama-bench-shaped markdown) is retained as a *view*, `-o md-llamabench`. It is no longer the goal and no longer a gate.
+
+---
+
+## 1. The measurement contract
+
+Write this into `docs/contract.md` and make it the first thing the README links to. Every result the tool emits must satisfy it, on both backends, or be refused.
+
+**Timed region.** From the last byte of the request leaving the client socket, to the last byte of the final content chunk arriving. Nothing about the server's internals defines the boundary — the boundary is the wire, because the wire is the only place that is definitionally identical on both backends.
+
+**Included, by construction:** admission/queue, tokenization, prefill, decode, sampling, detokenization, serialization, transport.
+**Excluded, by construction:** connection setup (pre-established, warm), model load, compile/graph capture, DNS.
+
+**Initial condition.** Before the timer starts, on both backends:
+1. Model fully resident; all lazy init complete (see warmup convergence, §2.9).
+2. KV cache state for the measured sequence is **defined** — either empty (default) or a verified prefix of exactly `d` tokens (depth tests). Never "whatever was left over."
+3. No other in-flight work, unless concurrency is the variable under test.
+4. Clocks settled; no thermal transient.
+
+**Sub-measurements** (TTFT, ITL, TPOT, E2E) are derived from client timestamps by **one implementation in `metrics.py`**, from the same raw record schema, for both backends. There is no per-backend metric code. If you find yourself writing `if backend == "vllm"` inside `metrics.py`, you have broken the contract.
+
+**Server-reported numbers (`src=server`) are diagnostics, not results.** They explain gaps; they never appear in a cross-backend comparison table. Demote them accordingly — see §5.
+
+---
+
+## 2. The parity axes
+
+The tool must **verify equivalence before benchmarking** and refuse to emit a cross-backend comparison when an axis is unmatched. Build this as `llmbench parity --a <url> --b <url>` and run it automatically at the start of any comparison run, writing `parity.json` next to the results.
+
+For each axis: read it from both servers, normalise it, compare, and classify as `matched` / `mismatched` / `unverifiable`.
+
+### 2.1 Weights and numerics
+Same architecture, same parameter count, same quantization scheme, same compute dtype. **This is the hardest axis and it has no clean answer — see §3.**
+
+### 2.2 KV cache dtype
+llama.cpp `-ctk`/`-ctv` vs vLLM `--kv-cache-dtype`. Default f16 on both. A run comparing f16 against fp8 KV is not a backend comparison.
+
+### 2.3 Context capacity — *the most commonly botched axis*
+llama.cpp `-c` is the **total** context pooled across slots; each slot effectively gets `n_ctx / n_parallel`. vLLM `--max-model-len` is **per request**.
+
+To match vLLM at `max_model_len = M`, `max_num_seqs = N`, launch llama.cpp with `-c M*N -np N`.
+
+Compute the per-request context budget on both sides and compare *that*, not the raw flags. Emit both the flag values and the derived budget in the parity report.
+
+### 2.4 KV memory budget
+vLLM preallocates by `gpu_memory_utilization`; llama.cpp allocates `n_ctx × n_seq_max` worth of cells. Compute actual KV bytes for both:
+
+```
+kv_bytes = 2 * n_layers * n_kv_heads * head_dim * dtype_bytes * n_tokens_capacity
+```
+
+Report both, and the ratio. Giving one backend 4× the KV budget and calling the result a throughput comparison is the single easiest way to publish a wrong number.
+
+### 2.5 Batch/admission shaping
+llama.cpp `-b` / `-ub` vs vLLM `max_num_batched_tokens`. Chunked prefill on/off on both (explicit flag in vLLM; implicit in llama.cpp — record that it cannot be disabled there).
+
+### 2.6 Attention backend
+Flash attention on/off on both (`-fa` vs vLLM's attention backend selection). Record the actual backend each selected, not the requested flag — both do auto-selection.
+
+### 2.7 Prefix-cache state
+Off on both, or on on both. Never mixed. Record the effective state as observed (probe it — see §2.10), not as requested.
+
+### 2.8 Sampling
+Greedy on both: `temperature = 0`, no top-k/top-p/penalties, `ignore_eos: true`, fixed `max_tokens`. Sampling cost is real and asymmetric — llama.cpp samples per slot on the scheduler thread, vLLM samples the whole batch on GPU — so any non-greedy config makes the comparison about the samplers.
+
+### 2.9 Warm state — replace fixed warmup with convergence
+vLLM does `torch.compile` and CUDA-graph capture at startup; llama.cpp does not. A fixed "1 warmup run" leaves vLLM measured mid-warmup and is an unfair initial condition.
+
+Replace the fixed warmup with **convergence-based warmup**: run the target config repeatedly, discarding results, until the rolling standard deviation over the last `k` runs falls below a threshold (default: 2% of the rolling mean, `k=5`), with a hard cap. Record how many warmup iterations each backend needed — that number is itself a reportable finding. `--no-warmup` disables; `--warmup-fixed N` for llama-bench-comparable behaviour.
+
+### 2.10 Observed vs requested
+Every axis above must be **probed, not trusted**. Requested flags lie: auto-selection, silent fallbacks, plugin defaults, and version drift all mean the effective config differs from the command line. Where an axis cannot be probed, mark it `unverifiable` and downgrade the run's confidence — do not assume it matched.
+
+**Emit a parity report at the top of every comparison output**, listing each axis with `matched | mismatched | unverifiable` and the two observed values. If any axis is `mismatched`, the comparison table prints with a loud header and every row flagged. This is not decoration; it is the tool's main honesty mechanism.
+
+---
+
+## 3. The GGUF fork — an axis with no clean answer
+
+There is no configuration that is simultaneously *identical weights* and *fair to both backends*:
+
+- **Same GGUF file on both.** Identical weights and tokenizer — the strongest possible numerics parity. But vLLM's GGUF path is experimental, explicitly documented as under-optimized, and now lives **out-of-tree** in a separate `vllm-gguf-plugin` package with a generic weight-name adapter and no guarantee that a model in vLLM's supported list works as GGUF. You are measuring vLLM's worst path and calling it vLLM.
+- **Each backend's native format** (GGUF vs FP16/FP8/AWQ/GPTQ). Each backend at its best — but different weights, different numerics, different output quality. You are no longer comparing engines; you are comparing engine+quantization stacks.
+
+Make this an explicit, **required** flag with no default:
+
+```
+--parity-mode {weights,native}
+```
+
+- `weights` — same GGUF both sides. Tool must record that vLLM is on the plugin path, capture the plugin version, and stamp every row `vllm_gguf_plugin`. Note that vLLM requires a separately specified tokenizer for GGUF; record which one.
+- `native` — each backend on its preferred format. Tool must record both formats and refuse to print a single "speedup" number without the quality divergence check below.
+
+### Quality divergence check (new, required for `native`)
+
+Throughput is meaningless if the two systems are producing different output. Add `llmbench quality`:
+
+1. Fixed set of prompts, greedy decoding, `max_tokens = 128`, identical token-ID inputs.
+2. Collect generated token IDs from both backends.
+3. Report: exact-match rate, first-divergence position distribution, and — if logprobs are available on both — mean KL over the top-k distribution.
+
+Print a one-line summary in the comparison header, e.g. `quality: 62% exact match, median divergence @ token 19`. A 2× throughput win at 60% exact match is a different claim from a 2× win at 99%, and the table must not let the reader confuse them.
+
+---
+
+## 4. Workload identity — stronger than "same lengths"
+
+The original spec required matching *token counts*. Under the contract that is not enough.
+
+- In `--parity-mode weights`, the tokenizer is identical, so send **byte-identical token-ID arrays** to both backends. Same random seed, same sequence, same order, same arrival timestamps. Persist the generated workload to `workload.jsonl` so a run is exactly replayable against a third backend later.
+- In `--parity-mode native`, tokenizers may differ. Generate the workload as **token IDs for a designated reference tokenizer**, decode to text once, and send the same text to both — then record each backend's resulting `prompt_tokens` separately and report the discrepancy. Do not silently pad one side to match the other.
+
+Random-token workloads defeat prefix caching by construction and are the right default. Keep `--shared-prefix` and the dataset mode, but require the same dataset and same seed on both sides, and record the seed.
+
+---
+
+## 5. Concrete changes to the existing code
+
+| Module | Change |
+|---|---|
+| `metrics.py` | **Audit for backend branches and remove them.** One implementation, both backends, from the raw record schema. Add a unit test asserting no backend identifier is referenced in this module. |
+| `backends/base.py` | Add `capacity()` returning normalised `{per_request_ctx, max_concurrent, kv_bytes, kv_dtype, attn_backend, prefix_cache_enabled, batch_token_budget, chunked_prefill}`. Each backend computes these from its own probes — this is where the flag-normalisation lives, not in the runner. |
+| **new** `parity.py` | The axis table, probing, classification, `parity.json`, and the refusal logic. |
+| **new** `quality.py` | The divergence check of §3. |
+| `runner.py` | Replace fixed warmup with convergence warmup (§2.9). Call parity preflight before any comparison run. |
+| `prompts.py` | Add workload persistence/replay (`workload.jsonl`) and the two parity-mode paths of §4. |
+| `printers/` | Add the parity header block and row flags. Rename the llama-bench-shaped table to `-o md-llamabench` and make the default `md` the parity-annotated table. |
+| `cli.py` | Add `--parity-mode` (required for comparison runs), `llmbench parity`, `llmbench quality`, `llmbench calibrate`. |
+| `env.py` | Capture vLLM plugin versions, actual attention backend, actual KV dtype, CUDA graph / compile state, and the observed-vs-requested delta for every axis. |
+
+### `llmbench calibrate` (replaces the old Gate A)
+
+Runs, on the same machine and model: native `llama-bench`, then `llmbench` against `llama-server` with matched params. Reports the delta as the **HTTP + server + scheduler tax**, with a breakdown against `src=server` timings. This turns the old acceptance criterion into a *diagnostic*: we now expect and quantify the gap instead of trying to close it.
+
+---
+
+## 6. What to delete or demote
+
+- **Delete** "match native llama-bench within 5%" as a gate. It is now `calibrate`, a report, not a pass/fail.
+- **Demote** `src=server` to the diagnostic pane. It must not appear in cross-backend tables — llama.cpp's `timings` and vLLM's `/metrics` histograms are measured at different points in different pipelines and are not comparable to each other. They are only comparable to *themselves across runs*.
+- **Demote** llama-bench output-format fidelity from a gate to a compatibility view.
+- **Keep** everything in the previous spec about context shift, slot starvation, preemption detection, TTFT contamination, and arrival modes. Those were right and become more important, not less.
+
+---
+
+## 7. Revised gates
+
+- **G1 — Contract conformance.** Against the fake SSE server, both backend adapters produce identical raw records for identical injected timings. Any divergence is an adapter bug, not a backend difference.
+- **G2 — Parity preflight.** Deliberately mismatch each axis one at a time; the tool must detect and refuse every one. A parity checker that never fires is untested.
+- **G3 — Self-consistency.** Same backend, same config, two runs: stddev-overlapping.
+- **G4 — Calibration.** `llmbench calibrate` produces a stable, explainable HTTP+scheduler tax on llama.cpp at `c=1`. Stability matters; the magnitude does not need to be small.
+- **G5 — Anchor agreement.** `llmbench` client numbers vs `vllm bench serve` at matched rate/burstiness/dataset — within a few percent. This is now the primary external anchor, because it is the one measured at the same point in the pipeline as ours.
+- **G6 — Concurrency anchor.** At `c>1` on llama.cpp, compare against `llama-server` + `tools/server/bench` (k6) or `llama-parallel` — **not** `llama-batched-bench`, which has no arrival process.
+- **G7 — Quality.** The divergence check runs and reports; a `native`-mode comparison without it is refused.
+- **G8 — Replay.** A persisted `workload.jsonl` replayed against the same backend reproduces the original run within noise.
+
+---
+
+## 8. Milestone delta
+
+Insert before continuing current work:
+
+- **M2.5 — `parity.py` and the axis table.** Probing, normalisation, `parity.json`, refusal logic, G2. Nothing downstream is trustworthy until this exists.
+- **M3.5 — Convergence warmup and workload persistence.** Both are initial-condition requirements, not conveniences.
+- **M4.5 — `quality.py` and `calibrate`.**
+
+Then resume the original milestones 4–6 with the revised gates.
+
+---
+
+## 9. The claim the tool is allowed to make
+
+At the end of a comparison run, the tool may print exactly one headline claim, and only if every parity axis is `matched`:
+
+> Under [contract], with [parity axes], backend A achieved X tok/s and backend B achieved Y tok/s at [quality divergence].
+
+If any axis is `mismatched` or `unverifiable`, it prints instead:
+
+> Not a valid comparison. Unmatched axes: [...]. Per-backend results below are individually valid and jointly meaningless.
+
+Build that refusal path first and test it. A benchmark tool's credibility is set entirely by what it declines to claim.

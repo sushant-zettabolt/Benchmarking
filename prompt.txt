@@ -1,0 +1,337 @@
+# Build `llmbench`: an endpoint-driven, llama-bench-compatible inference benchmark harness
+
+You are building a Python CLI tool from scratch. Read this whole document before writing any code.
+
+---
+
+## 0. Non-negotiables
+
+1. **Do not guess at reference behaviour.** You will clone `llama.cpp` and `vllm` and read their actual source. Every claim in this document that starts with "llama-bench does X" or "vLLM does Y" must be verified against the cloned source before you rely on it. If the source disagrees with this document, the source wins — tell me about the discrepancy.
+2. **Never aggregate at collection time.** Every request produces a raw record with timestamps. Statistics are computed later, from the raw records, by a separate module.
+3. **A number without provenance is a bug.** Every result row must carry: backend, backend version/build, model identity, server launch flags (or `unknown`), all test params, measurement source, load mode, and timestamp.
+4. **The two backends are architecturally different in ways that silently invalidate naive comparisons.** §4 is not background reading — it drives concrete requirements throughout. Do not skip it.
+5. **Stop at each milestone** (§13) and report before continuing. Do not build the whole thing in one pass.
+
+---
+
+## 1. Bootstrap: clone the references
+
+```bash
+mkdir -p reference && cd reference
+git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+git clone --depth 1 https://github.com/vllm-project/vllm.git
+cd llama.cpp && git rev-parse HEAD && cd ..
+cd vllm && git rev-parse HEAD && cd ..
+```
+
+Write both commit SHAs and clone dates to `reference/PINNED.md`. Add `reference/` to `.gitignore` — these are read-only references, not dependencies. **We do not import from them and we do not vendor their code.**
+
+### Files you must read before designing anything
+
+**llama.cpp** (the behavioural spec we are matching):
+- `tools/llama-bench/llama-bench.cpp` — the `cmd_params` struct and `cmd_params_defaults`; `print_usage()`; `get_cmd_params_instances()` (the Cartesian product and its loop nesting); the `test` struct including `get_ts()`, `avg()`, `stdev()`; `test_prompt()` and `test_gen()`; and **all five printers** (`markdown_printer`, `csv_printer`, `json_printer`, `jsonl_printer`, `sql_printer`).
+- `tools/llama-bench/README.md`
+- `tools/server/README.md` and `tools/server/README-dev.md` — the endpoint list and request/response schemas. Specifically: `/completion` and its `cache_prompt`, `timings_per_token`, `n_predict`, `ignore_eos` fields; the `timings` object; `/tokenize`, `/detokenize`, `/props`, `/health`, `/slots`, `/metrics`; and the launch flags `-np`, `-c`, `--cache-ram`, `--cache-idle-slots`, `--no-context-shift`.
+- `tools/server/server.cc` (or equivalent) — `update_slots()` / `pre_decode()`: slot selection, prompt-cache reuse, context shift, and the fact that **there is no preemption**.
+- `tools/llama-batched-bench/` and `tools/parallel/` — these are the correct comparison points for concurrent workloads, not `llama-bench`. Note how they build batches and what they report (`S_PP`, `S_TG`, `S`).
+
+**vLLM** (the reference for doing it over HTTP correctly):
+- Locate the serving benchmark (around `vllm/benchmarks/serve.py`) and read `BenchmarkMetrics` and `calculate_metrics()`.
+- Locate the async request functions it uses (the OpenAI-completions request func). Read carefully **how it timestamps first token** and **how it parses SSE chunks** — this is the part people get wrong.
+- `docs/benchmarking/cli.md` — TTFT/TPOT/ITL definitions and the flag surface, including `--request-rate`, `--burstiness`, `--max-concurrency`.
+- The V1 scheduler and `KVCacheManager` / `BlockPool` — enough to understand preemption and global prefix-cache hashing.
+- The Prometheus metric names exposed at `/metrics`, especially the TTFT/TPOT histograms, token counters, and **`vllm:num_preemptions_total`**.
+
+Produce a short `docs/reference-notes.md` summarising what you found, with file:line pointers. I will read this before you write the runner.
+
+---
+
+## 2. What you are building
+
+A single Python package, `llmbench`, that points at an **HTTP inference endpoint** (vLLM or llama.cpp server, OpenAI-compatible) and produces measurements that are as close as possible to what `llama-bench` produces in-process — with the same input surface and the same output format — while being honest about where the two backends stop being comparable.
+
+Console entry point:
+
+```bash
+llmbench --url http://127.0.0.1:8080 -m qwen2.5-7b-instruct-q4_k_m -p 512 -n 128 -r 5
+```
+
+Prints, on stdout, a table a llama-bench user recognises instantly:
+
+```
+| model                | size      | params | backend | ngl | src    |  test | t/s              |
+| -------------------- | --------: | -----: | ------- | --: | ------ | ----: | ---------------: |
+| qwen2 7B Q4_K - M    | 4.36 GiB  | 7.62 B | CUDA    |  99 | server | pp512 | 3421.55 ± 18.02  |
+| qwen2 7B Q4_K - M    | 4.36 GiB  | 7.62 B | CUDA    |  99 | client | pp512 | 2988.10 ± 41.77  |
+```
+
+---
+
+## 3. Measurement: the two paths
+
+`llama-bench` times `llama_decode()` in-process. Tokenization and sampling are excluded; there is no HTTP, no server, no scheduler, no queue. **You cannot reproduce that number from outside the process.** So we collect two numbers and never mix them in one column.
+
+### Path A — `client`: black-box, wall-clock, from the requesting process
+
+Stream via SSE and timestamp with `time.perf_counter_ns()`:
+- `t_send` — immediately before the request is written
+- `t_first_token` — on the **first chunk carrying non-empty generated content** (not the first byte, not an empty role/priming chunk)
+- `t_token[i]` — every subsequent content chunk
+- `t_last_token` / `t_end`
+
+Derived: TTFT, ITL array, E2E, TPOT = `(E2E − TTFT) / (n_gen − 1)`.
+
+This measures prefill + queue + tokenize + sample + detokenize + serialize + network. It is **comparable across backends** and is our primary cross-backend number.
+
+### Path B — `server`: white-box, backend-reported
+
+- **llama.cpp**: the `/completion` response carries a `timings` object (`prompt_n`, `prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`, `predicted_per_second`). Measured inside the server, close to llama-bench semantics. **This is the number we compare against native `llama-bench`.** Verify exact field names against the server README.
+- **vLLM**: no per-response timings. Scrape `/metrics` before and after each repetition and delta the TTFT / time-per-output-token / e2e histograms and token counters. If `/metrics` is unavailable, mark `src=server` rows `N/A` — never fake them.
+
+### The gap between A and B is asymmetric between backends
+
+Report `overhead_ms = client_e2e − server_total`. Do not assume it means the same thing on both:
+
+- **llama.cpp**: the server's single scheduler thread performs batch assembly, per-slot sampling, and stop-string checking sequentially. Much of what looks like "client overhead" is *on the server's critical path* and costs multi-sequence throughput directly.
+- **vLLM**: sampling is a batched GPU op, and detokenization / output processing are pushed off the critical path (async output processing). Overhead there is genuinely parallel to decode.
+
+So a larger `overhead_ms` on llama.cpp is not the same defect as a larger one on vLLM. State this in the report legend.
+
+If A and B are *identical*, be suspicious — you are probably reading the same source twice.
+
+`--measure {client,server,both}`, default `both`. In `both` mode emit one row per source, distinguished by the `src` column.
+
+---
+
+## 4. Architectural differences that change what you are measuring
+
+**Read this before designing the runner.** These are not trivia; each one maps to a requirement below.
+
+| | llama.cpp server | vLLM |
+|---|---|---|
+| KV cache | flat pre-allocated **cells**, contiguous ranges, no paging | paged **blocks** (16 tok), on-demand, refcounted, CoW |
+| Concurrency limit | fixed `server_slot` pool, `-np N`, static at launch; compile-time `LLAMA_MAX_SEQ` cap | soft `max_num_seqs`; real limit is free KV blocks |
+| Memory ceiling | `n_ctx × n_seq_max` regardless of actual use → **OOM/refusal at modest concurrency** | degrades gracefully via preemption |
+| Preemption | **none** — a slot runs to completion once assigned | yes — evict, free blocks, recompute later |
+| Out-of-context | **context shift** (`seq_add`, silently discards old tokens) or fail | preempt + recompute, never silently drops tokens |
+| Prefill chunking | implicit — a slot's prompt is fed in `n_batch` pieces with other slots' decode tokens riding along | explicit chunked prefill |
+| Prefix caching | **slot-granular**, matched against that slot's *previous* prompt, plus an LRU of serialized caches (`--cache-ram`) | **block-granular and global**, content-hashed, shared across all requests, **on by default** |
+| Admission | free slot | token budget + free blocks |
+
+### Requirements that follow
+
+1. **Context shift is a silent correctness hazard.** If `n_prompt + n_gen + n_depth` exceeds the server's per-slot context (`n_ctx / n_parallel` on llama.cpp), llama.cpp will quietly discard tokens and still return a plausible-looking result. At startup, read `n_ctx` and `n_parallel` from `/props`, compute the per-slot budget, and **refuse any instance that does not fit**. Recommend `--no-context-shift` on the server and record whether it was set. vLLM will not do this, so the failure mode is asymmetric — do not assume a passing vLLM run means the llama.cpp run was clean.
+2. **Prefix-cache defeat needs different tactics per backend.** llama.cpp matches only against a slot's previous prompt, so a unique random prefix per request is sufficient; also pass `cache_prompt: false` and recommend `--cache-ram 0`. vLLM hashes globally by content, so prefixes must be unique **across the entire run**, not just consecutive requests — use a per-run salt plus a per-request counter. Recommend launching vLLM with `--no-enable-prefix-caching` and record whether it was.
+3. **Our default measures the cache-miss ceiling.** Random-token prompts defeat prefix caching by construction. That is correct for llama-bench parity and it is the fair cross-backend number — but it is also the regime where the two backends are *most* similar. Add `--shared-prefix <n>` to deliberately exercise caching: all requests share an `n`-token prefix. Expect a large divergence here (global block sharing vs per-slot reuse); that divergence is one of the most useful things this tool can produce.
+4. **Concurrency means different things.** llama.cpp `-np N` is a static partition; exceeding it queues with no preemption, so TTFT inflates linearly and the tool is measuring queueing, not the engine. Read `/slots` at startup and refuse `-c` greater than the slot count without `--force`. vLLM instead preempts — poll `vllm:num_preemptions_total` around each instance and **flag any run where it increased**, because preempted requests get bimodal TTFT/ITL that destroys the mean.
+5. **At `c > 1`, `llama-bench` is the wrong reference entirely.** It has no scheduler. The correct llama.cpp comparison points are `llama-batched-bench` (static B×PP×TG grid, lock-step) and `llama-parallel` (simulated arrivals). Reflect this in the validation gates (§14) and say so in the README.
+6. **Closed-loop concurrency ≠ an arrival rate.** `-c N` holds N requests in flight; `vllm bench serve --request-rate` drives an open-loop Poisson process. These produce different queueing behaviour and are not interchangeable. Implement both: `-c` (closed loop, default) and `--request-rate` + `--burstiness` (open loop, Gamma-distributed inter-arrivals, matching vLLM's definition — read `serve.py` for the exact parameterisation). Record which mode produced each row; refuse to put them in the same table without a `mode` column.
+7. **llama.cpp may die rather than degrade.** At high concurrency or large `n_ctx × n_seq_max` it can OOM at launch or refuse the request. Distinguish "capacity limit reached" from "benchmark failed" in output and exit codes.
+
+---
+
+## 5. Architecture
+
+```
+llmbench/
+  __init__.py
+  cli.py            # arg parsing, llama-bench flag parity
+  config.py         # dataclasses; YAML loader; Cartesian expansion -> instances
+  backends/
+    base.py         # Protocol: detect, info, capacity, tokenize, detokenize,
+                    #           complete_stream, server_timings, metrics_snapshot
+    openai_common.py# shared SSE streaming + OAI-compat request building
+    llamacpp.py     # /props, /slots, timings, cache_prompt, context-shift guard
+    vllm.py         # /metrics delta scrape, preemption counter, prefix-cache probe
+  prompts.py        # exact-token-count synthesis; per-run salt; shared-prefix mode
+  arrivals.py       # closed-loop pool + open-loop Poisson/Gamma generator
+  runner.py         # warmup, reps, delay, capacity preflight, raw record emission
+  records.py        # RawRecord dataclass + JSONL/SQLite sink
+  metrics.py        # raw records -> Result rows (mean ± stddev, percentiles)
+  env.py            # host/GPU/driver/backend/model/flags capture
+  server/
+    manage.py       # optional: launch/teardown backend servers (§7)
+  printers/
+    markdown.py csv.py json.py jsonl.py sql.py
+tests/
+docs/
+```
+
+Dependencies: `httpx` (async, HTTP/1.1, streaming), plain dataclasses or `pydantic`, `pyyaml`, `rich` for progress only. **No `requests`.** No pandas; `statistics` covers the maths.
+
+`--backend {auto,llamacpp,vllm}`. `auto` probes `/props` + `/health` → llama.cpp; `/version` + `/metrics` → vLLM. Fail loudly if ambiguous.
+
+---
+
+## 6. Config: llama-bench flag parity
+
+Accept CLI flags and `--config bench.yaml`; CLI overrides YAML. **Every multi-valued flag takes comma-separated lists and repeats, and supports llama-bench's range syntax** (`first-last`, `first-last+step`, `first-last*mult`) — read llama-bench's parsing helper and replicate it.
+
+### Group 1 — request-shaping (we control per request)
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `-m, --model <name>` | model id sent to the endpoint / recorded | required |
+| `-p, --n-prompt <n>` | prompt tokens, prefill-only test | 512 |
+| `-n, --n-gen <n>` | generated tokens, decode-only test | 128 |
+| `-pg <pp,tg>` | combined test | none |
+| `-d, --n-depth <n>` | KV depth before the measured region | 0 |
+| `-r, --repetitions <n>` | reps per instance | 5 |
+| `--no-warmup` / `--delay <s>` | | off / 0 |
+| `-c, --concurrency <n>` | closed-loop in-flight requests | 1 |
+| `--request-rate <r>` / `--burstiness <b>` | open-loop arrivals | off / 1.0 |
+| `--shared-prefix <n>` | shared prefix tokens (cache test) | 0 |
+| `-o, --output <csv\|json\|jsonl\|md\|sql>` | stdout format | md |
+| `-oe, --output-err <...>` | stderr format | none |
+| `-v, --verbose`, `--progress` | | off |
+
+### Group 2 — server-side (fixed at launch)
+
+`-ngl`, `-fa`, `-ctk`, `-ctv`, `-b`, `-ub`, `-t`, `-sm`, `-mg`, `-ts`, `-nkvo`, `--poll`, `-ncmoe`, and the concurrency-shaping ones: `-np` / `max_num_seqs`, `n_ctx` / `max_model_len`.
+
+Behaviour by `--server-mode`:
+- `attach` (default): values are **recorded as metadata** and printed. `llmbench` verifies them against `/props` where possible and **errors on mismatch** rather than reporting a wrong `ngl`. More than one value for a Group-2 flag in `attach` mode is an error.
+- `manage`: see §7.
+
+### Group 3 — HTTP-specific
+
+`--url`, `--api-key`, `--backend`, `--measure`, `--server-mode`, `--endpoint {completions,chat}` (default `completions`), `--no-verify-tokens`, `--force`, `--out-dir`, `--tag <label>`.
+
+---
+
+## 7. `--server-mode manage` (milestone 5 — do not build early)
+
+To match llama-bench's Cartesian product, Group-2 params must vary, which requires restarting the server. In `manage` mode `llmbench` takes `--server-cmd` (a template) and per Group-2 combination:
+
+1. Renders and launches the server as a subprocess.
+2. Polls readiness (`/health`; `/v1/models` for vLLM) with a timeout.
+3. Runs all Group-1 instances against it.
+4. Terminates it, waits for port release, captures stdout/stderr to `out-dir/logs/`.
+
+Order the loop to minimise restarts — mirror the nesting in `get_cmd_params_instances()`.
+
+If the server fails to start, distinguish **capacity failure** (OOM from `n_ctx × n_seq_max`, a very real llama.cpp outcome) from a config error, and record the former as a legitimate data point: "did not fit". If the server dies mid-run, bail; never emit partial rows as complete.
+
+---
+
+## 8. Prompt construction — get this exactly right
+
+llama-bench feeds **random token IDs**, BOS first if the vocab wants one. Reproduce that:
+
+1. **Preferred:** send the prompt as an **array of token IDs**. Both vLLM's `/v1/completions` and llama.cpp's server accept integer-array prompts. Exact `n_prompt` control, zero tokenizer ambiguity. Probe support at startup with a 1-token request; fall back to (2) if rejected.
+2. **Fallback:** random text → `/tokenize` → trim/pad to exactly `n_prompt` → `/detokenize` → re-tokenize to confirm the round trip is stable. Detokenize→retokenize is **not** guaranteed idempotent; assert and error on drift.
+
+Assert `usage.prompt_tokens == n_prompt` on every response unless `--no-verify-tokens`. A mismatch invalidates the run — and on llama.cpp may indicate context shift (§4.1) rather than a tokenizer issue, so report both possibilities.
+
+**Uniqueness:** per-run salt + per-request counter in the first tokens, so prompts are unique across the whole run (required for vLLM's global content hashing, not just consecutive-request uniqueness).
+
+**Forcing exactly `n_gen`:** `max_tokens = n_gen` **and** `ignore_eos: true`, plus `min_tokens` where supported. Assert `usage.completion_tokens == n_gen`. If the backend refuses `ignore_eos`, fail at startup — silently short generations poison TPOT.
+
+**`n_depth` emulation:** send a priming request with the `d`-token prefix, caching enabled, then the measured request as `prefix + test_tokens`. On llama.cpp this only works if the *same slot* serves both, so require `-np 1` (or `-c 1` with a single slot) for depth tests and say so. Verify the prefix was cached: llama.cpp `timings.prompt_n` should reflect only the uncached remainder; vLLM exposes cached-token counts in usage on recent versions. If unverified, mark the row `depth_unverified` — do not print it as a clean `@d` result.
+
+---
+
+## 9. Metrics & statistics
+
+### Raw record (one per request → JSONL + SQLite)
+
+```
+run_id, instance_id, rep_idx, ts_utc,
+backend, backend_version, model, model_size_bytes, model_n_params,
+server_flags_json, measure_src, load_mode (closed|open), request_rate, burstiness,
+n_prompt_target, n_prompt_actual, n_gen_target, n_gen_actual, n_depth,
+concurrency, shared_prefix_n,
+t_send_ns, t_first_token_ns, t_last_token_ns, t_end_ns, itl_ns[],
+server_prompt_n, server_prompt_ms, server_predicted_n, server_predicted_ms,
+cached_tokens, preemptions_delta, slots_busy_at_send,
+http_status, error, flags[]   # e.g. depth_unverified, cache_suspected, preempted
+```
+
+### Aggregation — match llama-bench exactly
+
+Read `test::get_ts()`. As of current source it computes, **per repetition**, `ts = n_tokens / (t_ns / 1e9)` with `n_tokens = n_prompt + n_gen`, then reports `avg(ts) ± stdev(ts)` over repetitions — *sample* standard deviation. **Verify and replicate identically**, including `%.2f ± %.2f` formatting and whatever llama-bench does when `reps == 1`. Our `t/s` column must be derivable from our raw records by that same formula.
+
+Also compute for the detailed report: TTFT, TPOT, ITL p50/p95/**p99**, E2E, prefill t/s, decode t/s, request throughput, total token throughput, `overhead_ms`.
+
+Report `mean ± stddev` for llama-bench parity **and** median/p95/p99 in the detailed view. Under concurrency — especially with vLLM preemption — the mean alone actively misleads.
+
+---
+
+## 10. Output
+
+### Markdown (default) — must look like llama-bench
+
+Columns: `model | size | params | backend | ngl | src | test | t/s`, same alignment markers, right-justified numerics. Add columns only when non-default: `c` (concurrency) when `>1`, `rate` when open-loop, plus any Group-2 param that varies across rows — llama-bench's `markdown_printer` prints a column only if values differ across tests. **Read that logic and copy it.**
+
+Test naming: `pp{n}`, `tg{n}`, `pp{n}+tg{n}`, with `@d{depth}` suffix.
+
+`size` and `params` come from llama.cpp `/props`; vLLM does not expose them — print `N/A`, never a guess.
+
+Append a footnote block for any row carrying flags (`cache_suspected`, `preempted`, `depth_unverified`, `context_shift_risk`). A flagged row must never look clean.
+
+### Other formats
+
+`csv`, `json`, `jsonl`, `sql` — mirror llama-bench's field sets, extended with `src`, `ttft_ms`, `tpot_ms`, `itl_p99_ms`, `overhead_ms`, `n_prompt_actual`, `cached_tokens`, `preemptions_delta`, `load_mode`, `url`, `tag`. Versioned schema (`"schema": 1`).
+
+Always write full raw JSONL + SQLite to `--out-dir` regardless of stdout format. Add `llmbench compare <run_a> <run_b>` that diffs runs and flags regressions beyond a threshold.
+
+---
+
+## 11. Traps — you will produce wrong numbers if you skip these
+
+1. **Prefix caching** — see §4.2. Detection: if rep 2..N prefill is >2× rep 1, abort with a caching warning.
+2. **Context shift** — see §4.1. Preflight the context budget; recommend `--no-context-shift`.
+3. **Preemption (vLLM)** — see §4.4. Delta `vllm:num_preemptions_total` per instance; flag nonzero.
+4. **Slot starvation (llama.cpp)** — `-c` above `-np` measures your own queue. Check `/slots`.
+5. **Chat templates** — `/v1/chat/completions` injects tokens, breaking exact `n_prompt`. Default to `/v1/completions`; warn if `--endpoint chat`.
+6. **TTFT contamination** — `Accept-Encoding: identity`, raw byte/line SSE parsing, no buffering proxy. Some servers emit an empty first chunk; timestamp the first non-empty content. Measure the floor with `-p 1 -n 1` and print it in verbose mode.
+7. **Client is the bottleneck** — above ~32 concurrency Python's event loop is what you are measuring. Per-chunk work = append one integer. Warn on client CPU saturation. Multi-process workers are a stretch goal.
+8. **Chunked prefill** — explicit in vLLM (on by default recently), implicit in llama.cpp. TTFT is not one clean forward pass in either at `c>1`. Record whether it is enabled.
+9. **Thermals and clocks** — honour `--delay`; capture GPU clocks/temp per instance via `nvidia-smi` when available.
+10. **Warmup** — one discarded warmup instance per config by default, mirroring llama-bench.
+11. **Never average closed-loop and open-loop rows together.**
+
+---
+
+## 12. Milestones — stop and report after each
+
+1. **Reference notes.** Clone, read, write `docs/reference-notes.md` with file:line pointers and discrepancies against this document. *No application code yet.* Include an explicit confirmation or correction of every claim in §4.
+2. **Single-shot client path.** One backend, `c=1`, streaming, correct TTFT/ITL/E2E, raw JSONL, JSON stdout. Validate against `vllm bench serve` — within a few percent.
+3. **Server path + second backend.** llama.cpp `timings`, vLLM `/metrics` delta scrape, `auto` detection, `--measure both`, `overhead_ms`, capacity preflight (context budget + slot count).
+4. **Full matrix + printers.** Cartesian expansion, range syntax, reps, warmup, delay, statistics parity, all five printers, llama-bench-shaped markdown, footnoted flags.
+5. **`--server-mode manage`**, `llmbench compare`, SQLite store.
+6. **Concurrency + arrival modes.** Closed-loop `-c`, open-loop `--request-rate`/`--burstiness`, preemption and slot-starvation detection, `--shared-prefix` cache-divergence test, percentile reporting.
+
+---
+
+## 13. Validation gates
+
+- **Gate A (c=1, llama.cpp):** build `llama-bench` from the clone, run `-m <model> -p 512 -n 128 -r 5`. Launch `llama-server` on the same model/machine/flags, run `llmbench` with the same params. **`src=server` rows must land within ~5% of native llama-bench.** Investigate before proceeding if not.
+- **Gate B:** `src=client` on llama.cpp must be *slower* than `src=server`, with a plausible stable `overhead_ms`. If client is faster, your timestamps are wrong.
+- **Gate C (c=1, vLLM):** `llmbench` client numbers vs `vllm bench serve` at matched input/output lengths and request rate — within a few percent.
+- **Gate D (c>1, llama.cpp):** compare against **`llama-batched-bench`** at matched B/PP/TG, *not* `llama-bench`. Expect our numbers to be lower (real scheduler, real HTTP, no lock-step); the gap should be explainable and stable.
+- **Gate E (open loop):** `--request-rate` mode vs `vllm bench serve --request-rate` at the same rate and burstiness — TTFT/TPOT percentiles within a few percent.
+- **Gate F (cache divergence):** with `--shared-prefix 1024`, vLLM should show a large prefill speedup that llama.cpp does not match at `c>1`. If both look identical, prefix caching is not actually engaged and your test is inert.
+- **Gate G (determinism):** the same config twice on an idle machine produces stddev-overlapping results.
+
+Record all gates with real numbers in `docs/validation.md`.
+
+---
+
+## 14. Tests
+
+- **Unit:** SSE chunk parser (frames split across TCP reads, `[DONE]`, empty chunks, malformed lines), range-syntax parsing, `get_ts()`/stddev against hand-computed values, Cartesian expansion ordering, Gamma inter-arrival generator distribution.
+- **Golden:** markdown printer output vs a captured real `llama-bench` table in `tests/golden/`, asserting column layout and alignment.
+- **Integration:** a fake OAI-compatible SSE server with injectable delays, asserting a known 100 ms TTFT and 10 ms ITL are recovered within tolerance. It should also be able to simulate: an empty first chunk, a stalled mid-stream, a truncated generation, and a cached-prefix response. **This is the most valuable test in the suite — build it in milestone 2.**
+
+---
+
+## 15. Deliverables
+
+`README.md`, `docs/reference-notes.md`, `docs/validation.md`, `bench.example.yaml`, `pyproject.toml` with a `llmbench` entry point, and the test suite.
+
+The README must state plainly, near the top:
+
+> `llmbench` measures an endpoint, not a decode loop. `src=server` approximates llama-bench; `src=client` is what your application will actually experience. They are different numbers and both are correct.
+>
+> At concurrency 1 with random tokens, llama.cpp and vLLM are close to comparable. Above that they are not measuring the same system: llama.cpp uses a fixed slot pool with no preemption and slot-local prefix caching; vLLM uses paged KV with preemption and global prefix caching. This tool makes that divergence visible rather than hiding it behind a single throughput number.
