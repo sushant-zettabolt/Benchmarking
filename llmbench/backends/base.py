@@ -47,6 +47,12 @@ class StreamChunk:
 class Backend(ABC):
     name: str = "base"
 
+    # Path B for vLLM is a /metrics delta scrape rather than per-response timings. The runner
+    # keys that behaviour off this flag rather than off isinstance(), so a wrapper that
+    # delegates to several vLLM backends (suite.lb.fanout.FanoutBackend, used for
+    # client-side multi-instance load balancing) still takes the same path.
+    supports_vllm_metrics: bool = False
+
     def __init__(self, base_url: str, api_key: str | None = None, timeout_s: float = 300.0):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key

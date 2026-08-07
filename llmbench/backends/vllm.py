@@ -33,8 +33,33 @@ METRIC_PROMPT_TOKENS_TOTAL = "vllm:prompt_tokens_total"
 METRIC_GENERATION_TOKENS_TOTAL = "vllm:generation_tokens_total"
 
 
+def _normalise_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Lift vLLM's nested prefix-cache counter to the flat key the recorder reads.
+
+    vLLM reports prefix-cache hits as `usage.prompt_tokens_details.cached_tokens`, following
+    the OpenAI schema; llama.cpp reports the equivalent as a flat `timings.cache_n`. The
+    recorder reads one flat `usage["cached_tokens"]` for both, so without this the field was
+    silently None on every vLLM row -- and `cached_tokens` is the only direct evidence that a
+    prefix actually hit rather than being re-prefilled. A prefix-caching experiment on vLLM
+    was therefore unfalsifiable: hits and misses looked identical.
+
+    Normalising here rather than in metrics.py is deliberate: metrics.py must contain no
+    backend-specific branch (enforced by tests/test_metrics_no_backend_branch.py), so
+    schema differences get flattened at the backend boundary.
+    """
+    if not usage:
+        return usage
+    if usage.get("cached_tokens") is None:
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens") if isinstance(details, dict) else None
+        if cached is not None:
+            usage = {**usage, "cached_tokens": cached}
+    return usage
+
+
 class VllmBackend(Backend):
     name = "vllm"
+    supports_vllm_metrics = True
 
     def __init__(self, base_url: str, api_key: str | None = None, timeout_s: float = 300.0):
         super().__init__(base_url, api_key, timeout_s)
@@ -170,7 +195,7 @@ class VllmBackend(Backend):
         choices = ev.get("choices") or []
         text = choices[0].get("text") if choices else None
         finish_reason = choices[0].get("finish_reason") if choices else None
-        usage = ev.get("usage")
+        usage = _normalise_usage(ev.get("usage"))
         # vLLM never carries a timings-equivalent object inline (docs/reference-notes.md §3).
         return StreamChunk(text=text, finish_reason=finish_reason, usage=usage, server_timings=None, raw=ev)
 

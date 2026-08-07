@@ -1,0 +1,92 @@
+# Minimal starting point -- copy, edit the paths, run. Every axis accepts a scalar or a list;
+# a list means "sweep it". Lists multiply, so two 3-value axes is 9 deployments, not 3.
+#
+#   llmbench sweep plan --spec my.yaml     # see what it WOULD do, launch nothing
+#   llmbench sweep run  --spec my.yaml     # do it
+#
+# Unknown keys are a hard error, not a silent ignore: `instaces: 4` fails at parse time
+# rather than quietly running a different sweep than you asked for.
+
+name: my-sweep
+out_dir: out/my-sweep
+mode: online              # online (HTTP server) | offline (native tools) | both
+
+# ---------------------------------------------------------------- cores / NUMA
+cpu:
+  budget: "0-95"          # which cpus the whole sweep may use. 0-95 = node 0 on this host
+  smt: exclude            # exclude (1 thread/core, default) | include | only-siblings
+  ccd_align: true         # keep instance boundaries on L3/CCD boundaries
+  reserve: 0              # physical cores held back for nginx/the client (rounds up to a CCD)
+  numa_policy: membind    # membind (default) | interleave | none
+
+lb:
+  kind: client            # client = no proxy, most accurate. nginx = production topology,
+                          # and the proxy hop is INSIDE the measured window
+  # port: 18081
+  # n_cpus: 4             # how many idle cpus to find for nginx
+  # cpus: "96-99"         # explicit placement, used verbatim (n_cpus then ignored)
+
+# ---------------------------------------------------------------- where things live
+backends:
+  llamacpp:
+    model: /path/to/model.gguf
+    served_model_name: my-model
+    server_bin: /path/to/llama-server
+    offline_bin: /path/to/llama-bench           # mode: offline/both, batch_size 1
+    batched_bin: /path/to/llama-batched-bench   # mode: offline/both, batch_size > 1
+    base_port: 8100                             # instance i listens on base_port + i
+    env: {LD_LIBRARY_PATH: /path/to/llama.cpp/build/bin}
+
+  # vllm:
+  #   model: /path/to/hf-model-dir
+  #   server_bin: /path/to/venv/bin/vllm
+  #   offline_bin: /path/to/venv/bin/vllm       # `vllm bench latency`
+  #   base_port: 8200
+  #   extra_args: ["--enable-prefix-caching"]
+  #   env: {VLLM_CPU_KVCACHE_SPACE: "32"}
+
+# ------------------------------------------------- server axes (change = relaunch, minutes)
+deployment:
+  backend: [llamacpp]
+  instances: [1]          # 1 = all budget cores; 2 = budget split in half; etc.
+  n_parallel: [1]         # SERVER slots (-np / --max-num-seqs). Must be >= concurrency
+  n_ctx: [4096]
+  batch: [2048]
+  ubatch: [512]
+  # cores_per_instance: [24]     # pin instance size instead of splitting the budget evenly
+  # threads_per_instance: [48]   # override -t; warns if it does not match the allocation
+
+# ------------------------------------------ client axes (run against a live, warm deployment)
+workload:
+  n_prompt: [512]         # -> pp512 tests (prefill)
+  n_gen: [128]            # -> tg128 tests (decode)
+  # pg: ["512,128"]       # -> combined pp512+tg128, the realistic request shape
+  concurrency: [1]        # CLOSED loop: N requests in flight at all times = N users
+  # request_rate: [5.0]   # OPEN loop instead: arrivals/sec regardless of server keeping up
+  # burstiness: 1.0       # 1.0 = Poisson, inf = perfectly even
+  shared_prefix: [0]      # 0 = every prompt unique (cache miss). >=16 to exercise a prefix cache
+  # n_depth: [0]          # unique-per-request priming prefix, for deep-context emulation
+  reps: 20                # TOTAL requests, not per user. Keep >= 10x concurrency
+  # force: false          # allow concurrency > total slots, to measure queueing on purpose
+
+# --------------------------------------------------- native offline tools (mode: offline/both)
+offline:
+  batch_size: [1]         # 1 -> llama-bench; >1 -> llama-batched-bench -npl / vllm --batch-size
+  n_prompt: [512]
+  n_gen: [128]
+  reps: 3
+
+# ---------------------------------------------------------------- what "best" means
+objective:
+  metric: total_token_throughput   # any metric column: ttft_ms_p99, itl_ms_p95, tps_mean, ...
+  goal: max                        # max | min
+  src: client                      # client = wall-clock, comparable. server = diagnostic only
+
+constraints:                       # a config failing any of these is infeasible
+  - {metric: ttft_ms_p99, max: 5000}
+  - {metric: itl_ms_p95, max: 200}
+
+startup_timeout_s: 1800   # vLLM on CPU loads and compiles; give it room
+request_timeout_s: 600
+settle_s: 5
+continue_on_error: true   # one bad trial is recorded, the sweep continues

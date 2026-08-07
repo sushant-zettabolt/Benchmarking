@@ -17,6 +17,36 @@ from .base import Backend, Capacity, ServerInfo, StreamChunk
 from .openai_common import DONE, SSEParser, build_completions_payload
 
 
+def _with_cached_tokens(usage: dict[str, Any] | None,
+                        timings: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Expose llama.cpp's prompt-cache hit under the same key vLLM's arrives on.
+
+    llama.cpp reports reused prompt tokens as `timings.cache_n`; vLLM reports the same
+    quantity as `usage.prompt_tokens_details.cached_tokens`. The recorder reads one flat
+    `usage["cached_tokens"]`, so previously llama.cpp populated only `server_cache_n` and
+    vLLM only `cached_tokens` -- and the report has a column for the latter but not the
+    former. A prefix-cache sweep therefore showed a blank cache column for llama.cpp even
+    though the server had reported the hit, and the evidence had to be dug out of the raw
+    records by hand.
+
+    `server_cache_n` is deliberately left alone: it stays the backend-native field, and this
+    only adds the cross-backend view. Measured live: shared_prefix 512 -> cache_n 513,
+    shared_prefix 896 -> 897, shared_prefix 0 -> 0.
+    """
+    if not timings:
+        return usage
+    cache_n = timings.get("cache_n")
+    if cache_n is None:
+        return usage
+    if usage is None:
+        # llama.cpp can send timings on a chunk that carries no usage block. A dict with just
+        # this key is safe: every other read of usage is a .get() with a fallback.
+        return {"cached_tokens": cache_n}
+    if usage.get("cached_tokens") is None:
+        return {**usage, "cached_tokens": cache_n}
+    return usage
+
+
 class LlamaCppBackend(Backend):
     name = "llamacpp"
 
@@ -141,8 +171,8 @@ class LlamaCppBackend(Backend):
         choices = ev.get("choices") or []
         text = choices[0].get("text") if choices else None
         finish_reason = choices[0].get("finish_reason") if choices else None
-        usage = ev.get("usage")
         timings = ev.get("timings")
+        usage = _with_cached_tokens(ev.get("usage"), timings)
         return StreamChunk(text=text, finish_reason=finish_reason, usage=usage, server_timings=timings, raw=ev)
 
     async def metrics_snapshot(self) -> dict[str, Any]:

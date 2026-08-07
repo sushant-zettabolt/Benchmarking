@@ -1,0 +1,83 @@
+# Prefix-cache hit vs complete miss, Llama 3.1 8B BF16, node 0, 96 cores.
+#
+# The two arms differ in exactly one axis, measured against the same live server so nothing
+# else can move underneath them:
+#
+#   shared_prefix: 0    complete miss. Prompts are unique across the WHOLE run (per-run salt
+#                       + per-request counter folded into the leading tokens), which is what
+#                       vLLM's content-hashed global cache requires -- consecutive-request
+#                       uniqueness alone would still let request 40 hit request 3's blocks.
+#                       cache_prompt is off, so llama.cpp cannot warm it either.
+#   shared_prefix: 512  half the 1024-token prompt identical on every request.
+#   shared_prefix: 896  seven eighths identical.
+#
+# Both are well above the 16-token block a prefix cache matches on, so a hit is possible in
+# principle; `cached_tokens_mean` in the report says whether it actually happened. That column
+# was None on every vLLM row until the nested prompt_tokens_details.cached_tokens field was
+# lifted to the flat key the recorder reads -- without it this experiment is unfalsifiable.
+#
+# tg32 is a NEGATIVE CONTROL, not a result: a tg-only test sends one token, so it has no
+# shared prefix to reuse and its numbers must stay flat across all three arms. If they move,
+# something other than the cache changed and the pp rows cannot be trusted either.
+#
+# concurrency 1 and n_parallel 1 deliberately: one slot, one request in flight, so a TTFT
+# difference is prefill work and not queueing.
+
+name: cache-hit-vs-miss
+out_dir: out/bench-cache
+mode: online
+
+cpu:
+  budget: "0-95"
+  smt: exclude
+  ccd_align: true
+  numa_policy: membind
+
+lb:
+  kind: client
+
+backends:
+  llamacpp:
+    model: /scratch/zettabolt/data/models/gguf/Llama-3.1-8B-Instruct-BF16.gguf
+    served_model_name: llama-3.1-8b
+    server_bin: /scratch/zettabolt/data/llama.cpp/build/bin/llama-server
+    base_port: 8100
+    env:
+      LD_LIBRARY_PATH: /scratch/zettabolt/data/llama.cpp/build/bin
+
+  vllm:
+    model: /scratch/zettabolt/data/models/hf/Llama-3.1-8B-Instruct
+    served_model_name: llama-3.1-8b
+    server_bin: /home/zettabolt/sushant/Benchmarking/.venv/bin/vllm
+    base_port: 8200
+    # Explicit rather than relying on the V1 default, so the argv recorded in
+    # deployments.json proves which side of the experiment the server was on.
+    extra_args: ["--enable-prefix-caching"]
+    env:
+      VLLM_CPU_KVCACHE_SPACE: "32"
+
+deployment:
+  backend: [llamacpp, vllm]
+  instances: [1]
+  n_parallel: [1]
+  n_ctx: [4096]
+  batch: [2048]
+  ubatch: [512]
+
+workload:
+  n_prompt: [1024]        # pp1024 -- TTFT is prefill, which is where caching acts
+  n_gen: [32]             # tg32 -- the negative control described above
+  pg: ["1024,32"]         # the realistic shape: cached prefill followed by decode
+  shared_prefix: [0, 512, 896]
+  concurrency: [1]
+  reps: 10
+
+objective:
+  metric: ttft_ms_p50
+  goal: min
+  src: client
+
+startup_timeout_s: 1800
+request_timeout_s: 600
+settle_s: 5
+continue_on_error: true

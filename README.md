@@ -56,9 +56,52 @@ Raw per-request records are always written to `--out-dir` (JSONL + SQLite) regar
 stdout format -- results are never aggregated at collection time; `metrics.py` computes
 every statistic later, from those raw records.
 
+## Two ways to use it
+
+**Attach mode** (`llmbench ...`) points at a server you started yourself and measures it.
+
+**Sweep mode** (`llmbench sweep ...`) owns the servers: it decides their CPU/NUMA placement,
+launches N instances, load-balances across them, drives the workload, tears everything down,
+and reports which configuration was best against an objective you declare. It also drives each
+backend's native *offline* tools (`llama-bench`, `llama-batched-bench`, `vllm bench
+latency/throughput`) including static batch size.
+
+```bash
+llmbench sweep plan --spec sweep.yaml     # resolve and print; launches nothing
+llmbench sweep run  --spec sweep.yaml     # execute, then write report.{html,md,csv,json}
+llmbench sweep report out/sweep-8b        # re-render reports from stored artifacts
+```
+
+```yaml
+cpu:        { budget: "0-95", smt: exclude, ccd_align: true }
+lb:         { kind: nginx, uniform: true }
+deployment: { backend: [llamacpp, vllm], instances: [1, 2, 4], n_parallel: [1, 8] }
+workload:   { n_prompt: [16, 32, 64, 1024], n_gen: [64], concurrency: [1, 8], reps: 5 }
+offline:    { batch_size: [1, 4, 16] }
+objective:  { metric: total_token_throughput, goal: max }
+constraints: [{ metric: ttft_ms_p99, max: 5000 }]
+```
+
+See **[docs/sweep.md](docs/sweep.md)** for the full schema and
+[sweep.example.yaml](sweep.example.yaml) for a worked example. Highlights:
+
+- **CCD-aware core splitting.** 96 cores is 12 CCDs on an EPYC 9R14, so 1/2/3/4/6/12 instances
+  align to L3 boundaries and 8 does not — the planner says which, rather than silently handing
+  you a layout whose instances share cache.
+- **Placement is verified, not assumed.** `taskset` lies for llama.cpp (ggml clears thread
+  affinity after each compute); the suite reads `/proc/<pid>/task/*/status` instead.
+- **Offline rows are labelled not-comparable across backends** — `llama-bench` times
+  `llama_decode()` with no scheduler, `vllm bench latency` runs the full engine. Compare each
+  backend's offline number to its own online number, not to the other backend's.
+- **A constraint with no measurement fails.** An unmeasured SLO is not a met SLO.
+- **Only PIDs it started are ever signalled**, and target ports are checked free before
+  anything is torn down — this machine has other people's servers on it.
+
 ## Commands
 
 - `llmbench [flags]` -- run a benchmark against one endpoint (the default/implicit command).
+- `llmbench sweep {plan,run,report}` -- the orchestrated framework above
+  ([docs/sweep.md](docs/sweep.md)).
 - `llmbench parity --a <url> --b <url>` -- probe both servers, classify every parity axis
   (weights, KV dtype, context capacity, KV memory budget, batch shaping, attention backend,
   prefix-cache state, sampling, warm state) as `matched` / `mismatched` / `unverifiable`,

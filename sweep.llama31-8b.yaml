@@ -1,0 +1,76 @@
+# Llama 3.1 8B BF16, node 0 (96 physical cores), llama.cpp vs vLLM, 1 and 2 instances.
+#
+# Instance sizing is derived, not hardcoded: budget 0-95 split across `instances` gives
+# 96 cores at instances=1 and 48+48 at instances=2, both CCD-aligned (12 and 6 CCDs).
+#
+# concurrency is [1, 2] deliberately. At concurrency 1 a 2-instance fleet leaves one instance
+# idle for the whole measurement, so that row would describe one instance on half the cores
+# rather than the deployment -- the plan warns about exactly this. concurrency 2 is the
+# smallest load that puts both instances to work, so the 1-vs-2 comparison means something.
+# reps 20 keeps reps >= 10x concurrency, which is what makes a closed-loop number stable.
+
+name: llama31-8b-node0
+out_dir: out/bench-8b
+mode: both
+
+cpu:
+  budget: "0-95"          # node 0: 96 physical cores, 12 CCDs of 8
+  smt: exclude
+  ccd_align: true
+  numa_policy: membind
+
+lb:
+  kind: client            # no proxy hop inside the measured window
+  strategy: least-outstanding
+
+backends:
+  llamacpp:
+    model: /scratch/zettabolt/data/models/gguf/Llama-3.1-8B-Instruct-BF16.gguf
+    served_model_name: llama-3.1-8b
+    server_bin: /scratch/zettabolt/data/llama.cpp/build/bin/llama-server
+    offline_bin: /scratch/zettabolt/data/llama.cpp/build/bin/llama-bench
+    # llama-batched-bench is not built in this tree, so offline batch_size stays at 1 and
+    # routes to llama-bench (the canonical llama.cpp number). Nothing is silently substituted.
+    base_port: 8100
+    env:
+      LD_LIBRARY_PATH: /scratch/zettabolt/data/llama.cpp/build/bin
+
+  vllm:
+    model: /scratch/zettabolt/data/models/hf/Llama-3.1-8B-Instruct
+    served_model_name: llama-3.1-8b
+    server_bin: /home/zettabolt/sushant/Benchmarking/.venv/bin/vllm
+    offline_bin: /home/zettabolt/sushant/Benchmarking/.venv/bin/vllm
+    base_port: 8200
+    env:
+      VLLM_CPU_KVCACHE_SPACE: "32"
+      VLLM_LOGGING_LEVEL: INFO
+
+deployment:
+  backend: [llamacpp, vllm]
+  instances: [1, 2]
+  n_parallel: [2]         # >= max concurrency, so concurrency 2 is not a queueing measurement
+  n_ctx: [4096]
+  batch: [2048]
+  ubatch: [512]
+
+workload:
+  n_prompt: [16, 32]      # pp16, pp32
+  n_gen: [32]             # tg32
+  concurrency: [1, 2]
+  reps: 20
+
+offline:
+  batch_size: [1]
+  n_prompt: [16, 32]
+  n_gen: [32]
+  reps: 3
+
+objective:
+  metric: total_token_throughput
+  goal: max
+  src: client
+
+startup_timeout_s: 1800   # vLLM on CPU compiles and loads 16 GB of BF16 weights
+request_timeout_s: 600
+settle_s: 5
+continue_on_error: true

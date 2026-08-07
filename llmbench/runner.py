@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from . import metrics
 from .arrivals import generate_arrival_delays
 from .backends.base import Backend
-from .backends.vllm import METRIC_PREEMPTIONS_TOTAL, VllmBackend
+from .backends.vllm import METRIC_PREEMPTIONS_TOTAL
 from .config import CmdParams, Instance
 from .prompts import generate_depth_prefix_tokens, generate_prompt_tokens
 from .records import RawRecord
@@ -132,7 +132,7 @@ async def _send_one(
             if rec.server_cache_n is None or rec.server_cache_n < instance.n_depth:
                 rec.flags.append("depth_unverified")
 
-    if isinstance(backend, VllmBackend) and preemptions_before is not None:
+    if backend.supports_vllm_metrics and preemptions_before is not None:
         try:
             after = await backend.metrics_snapshot()
             after_val = after.get(METRIC_PREEMPTIONS_TOTAL)
@@ -206,7 +206,7 @@ async def run_instance(
     request_counter = [0]
 
     vllm_metrics_before = None
-    if isinstance(backend, VllmBackend) and params.measure in ("server", "both"):
+    if backend.supports_vllm_metrics and params.measure in ("server", "both"):
         try:
             vllm_metrics_before = await backend.metrics_snapshot()
         except Exception:  # noqa: BLE001 -- Path B is best-effort, never blocks the run
@@ -249,7 +249,7 @@ async def run_instance(
                 parity_mode=params.parity_mode or "", token_ids=token_ids,
             ))
         preemptions_before = None
-        if isinstance(backend, VllmBackend):
+        if backend.supports_vllm_metrics:
             try:
                 snap = await backend.metrics_snapshot()
                 preemptions_before = snap.get(METRIC_PREEMPTIONS_TOTAL)
@@ -375,5 +375,11 @@ def _attach_vllm_metrics_delta(rec: RawRecord, before: dict, after: dict) -> Non
         rec.server_prompt_n = round(prompt_tok / prefill_cnt)
     if gen_tok is not None and decode_cnt:
         rec.server_predicted_n = round(gen_tok / decode_cnt)
-    if cached_tok is not None:
-        rec.cached_tokens = round(cached_tok)
+    if cached_tok is not None and prefill_cnt:
+        # Per request, like server_prompt_n above -- NOT the raw delta. `vllm:prompt_tokens_
+        # cached_total` is a counter over the whole trial, so the undivided value lands in a
+        # per-request field as a trial-wide sum: measured here, a 1024-token prompt with a
+        # 896-token shared prefix reported 34048 cached tokens on one record (896 x 38
+        # requests) instead of 896. Every other quantity in this function is already divided
+        # by the request count; this one was not.
+        rec.cached_tokens = round(cached_tok / prefill_cnt)

@@ -119,6 +119,9 @@ class ResultRow:
     n_prompt_actual_mean: float | None = None
     cached_tokens_mean: float | None = None
     preemptions_delta_total: int | None = None
+    # >1 means the backend packed several tokens into one streamed chunk; see
+    # tokens_per_chunk_mean(). Read tpot_ms rather than itl_ms when it is.
+    tokens_per_chunk: float | None = None
 
     flags: list[str] = field(default_factory=list)
 
@@ -126,6 +129,22 @@ class ResultRow:
 def _mean_of(records: list[dict], key: str) -> float | None:
     values = [r[key] for r in records if not r.get("error") and r.get(key) is not None]
     return sum(values) / len(values) if values else None
+
+
+def _cached_tokens_mean(records: list[dict]) -> float | None:
+    """Prompt tokens served from cache, from whichever generic field carries them.
+
+    Two record fields express the same quantity because the servers name it differently, and
+    the normalisation that unifies them lives at the backend boundary -- so records written
+    before that existed have only one of the two populated. Preferring `cached_tokens` and
+    falling back to `server_cache_n` keeps one report column correct for both, and lets an
+    already-finished run pick it up on `sweep report --from-records`.
+
+    This is a field-presence fallback, not a backend branch: nothing here asks which server
+    produced the record, and either field may be present on either backend.
+    """
+    primary = _mean_of(records, "cached_tokens")
+    return primary if primary is not None else _mean_of(records, "server_cache_n")
 
 
 def _sum_of(records: list[dict], key: str) -> int | None:
@@ -211,6 +230,35 @@ def _itl_ms_values(records: list[dict]) -> list[float]:
     return out
 
 
+def tokens_per_chunk_mean(records: list[dict]) -> float | None:
+    """Generated tokens divided by the number of stream chunks that actually carried text.
+
+    ITL is measured between arrivals of *non-empty* content chunks, while the token count
+    comes from the server's own `usage.completion_tokens`. When those disagree this is above
+    1.0, and each itl_ns gap then spans several tokens rather than one -- so `itl_ms` stops
+    being an inter-token latency and overstates per-token cost by roughly this factor.
+
+    Two things can cause it and this number does not distinguish them: a server that packs
+    several tokens into one SSE event, or tokens that decode to an empty string (a partial
+    UTF-8 sequence emits nothing until the next token completes the codepoint, which random
+    token-ID prompts provoke often). Either way the reading is the same -- prefer `tpot_ms`,
+    which divides elapsed time by the authoritative token count and is unaffected.
+
+    Measured here: both backends returned 32 tokens across 7 text-bearing chunks at
+    concurrency 2 against a single server, turning a real ~122 ms/token into a 631 ms "ITL".
+    """
+    tokens = chunks = 0
+    for r in records:
+        if r.get("error"):
+            continue
+        n_gen = r.get("n_gen_actual") or 0
+        n_chunks = len(r.get("itl_ns") or []) + 1   # k gaps <=> k+1 content chunks
+        if n_gen > 0 and n_chunks > 1:
+            tokens += n_gen
+            chunks += n_chunks
+    return (tokens / chunks) if chunks else None
+
+
 def _prefill_tps_values(records: list[dict]) -> list[float]:
     out = []
     for r in records:
@@ -261,6 +309,7 @@ def aggregate_client(records: list[dict], test_name: str) -> ResultRow:
         ttft_ms=Stats.from_values(_ttft_ms_values(records)),
         tpot_ms=Stats.from_values(_tpot_ms_values(records)),
         itl_ms=Stats.from_values(_itl_ms_values(records)),
+        tokens_per_chunk=tokens_per_chunk_mean(records),
         e2e_ms=Stats.from_values(_e2e_ms_values(records)),
         prefill_tps=Stats.from_values(_prefill_tps_values(records)),
         decode_tps=Stats.from_values(_decode_tps_values(records)),
@@ -268,7 +317,7 @@ def aggregate_client(records: list[dict], test_name: str) -> ResultRow:
         total_token_throughput=(total_input + total_output) / dur_s if dur_s > 0 else None,
         overhead_ms=compute_overhead_ms(records),
         n_prompt_actual_mean=_mean_of(records, "n_prompt_actual"),
-        cached_tokens_mean=_mean_of(records, "cached_tokens"),
+        cached_tokens_mean=_cached_tokens_mean(records),
         preemptions_delta_total=_sum_of(records, "preemptions_delta"),
     )
     _apply_trap_flags(row, records)
@@ -340,3 +389,18 @@ def _apply_trap_flags(row: ResultRow, records: list[dict]) -> None:
         row.flags.append("depth_unverified")
     if any("context_shift_risk" in (r.get("flags") or []) for r in records):
         row.flags.append("context_shift_risk")
+    # Fewer text-bearing chunks than tokens makes itl_ms span several tokens per gap. The
+    # timing itself is right; the column just no longer means "per token", and is off by
+    # that factor -- so say so on the row rather than leaving a 631 ms "inter-token latency"
+    # sitting next to a genuine 122 ms/token.
+    tpc = tokens_per_chunk_mean(records)
+    if tpc is not None and tpc > 1.5:
+        row.flags.append("itl_spans_multiple_tokens")
+    # A request cannot reuse more cached prompt tokens than its prompt contains. When it
+    # appears to, the field is not a per-request count -- the case that produced this check
+    # was a server-side counter summed over a whole trial being written into a per-request
+    # field, which read as a 3300% cache hit rate on a 1024-token prompt and was believable
+    # enough at a glance to be quoted as a result.
+    if (row.cached_tokens_mean is not None and row.n_prompt_actual_mean
+            and row.cached_tokens_mean > row.n_prompt_actual_mean):
+        row.flags.append("cached_tokens_exceeds_prompt")

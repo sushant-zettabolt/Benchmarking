@@ -1,0 +1,97 @@
+# llmbench sweep spec.
+#
+# Two axis groups with very different costs:
+#   `deployment:` changes how servers are launched -> forces a relaunch of the whole fleet.
+#   `workload:`   changes only what the client sends -> runs against a live, warm fleet.
+# The planner nests deployment outermost so servers relaunch as rarely as possible.
+#
+# Validate and inspect without running anything:
+#   llmbench sweep --spec sweep.example.yaml --dry-run
+
+name: llama-vs-vllm
+out_dir: out/sweep-8b
+mode: both                  # online | offline | both
+
+# ---------------------------------------------------------------- CPU placement
+cpu:
+  budget: "0-95"            # inference servers get exactly these cores (NUMA node 0)
+  smt: exclude              # exclude | include | only-siblings
+  ccd_align: true           # keep instance boundaries on CCD (L3) boundaries
+  reserve: 0                # physical cores held back from the instance budget
+  membind: auto             # auto = bind memory to the node the cores live on
+  numa_policy: membind      # membind | interleave | none
+
+# ---------------------------------------------------------------- load balancing
+lb:
+  kind: nginx               # client | nginx | none
+  # cpus: "96-103"          # explicit placement, used verbatim (n_cpus is then ignored)
+  n_cpus: 4                 # how many idle cpus to find; never SMT siblings of busy cores
+  port: 18081
+  strategy: least-outstanding
+  uniform: true             # route 1-instance layouts through nginx too, so layouts compare
+  nginx_bin: nginx
+
+# ---------------------------------------------------------------- installations
+backends:
+  llamacpp:
+    model: /scratch/zettabolt/data/models/gguf/Llama-3.1-8B-Instruct-BF16.gguf
+    served_model_name: Llama-3.1-8B-Instruct-BF16
+    server_bin: reference/llama.cpp/build/bin/llama-server
+    offline_bin: reference/llama.cpp/build/bin/llama-bench
+    batched_bin: reference/llama.cpp/build/bin/llama-batched-bench
+    base_port: 8100
+    extra_args: ["--numa", "numactl"]
+
+  vllm:
+    model: /scratch/zettabolt/data/models/hf/Llama-3.1-8B-Instruct
+    served_model_name: Llama-3.1-8B-Instruct
+    server_bin: .venv/bin/vllm
+    offline_bin: .venv/bin/vllm
+    base_port: 8200
+    extra_args: ["--dtype", "bfloat16"]
+    env:
+      VLLM_CPU_KVCACHE_SPACE: "32"
+
+# ---------------------------------------------------------------- sweep axes
+deployment:
+  backend: [llamacpp, vllm]
+  instances: [1, 2, 4]      # fleet size; cores are split CCD-aligned across them
+  n_parallel: [1, 8]        # llama.cpp -np / vLLM --max-num-seqs
+  n_ctx: [4096]
+  batch: [2048]
+  ubatch: [512]
+
+workload:
+  n_prompt: [16, 32, 64, 1024]
+  n_gen: [64]
+  concurrency: [1, 8]
+  reps: 5
+  # request_rate: [5.0]     # set for open-loop arrivals instead of closed-loop concurrency
+
+# Native offline tools. llama.cpp: llama-bench (b=1) / llama-batched-bench -npl (b>1).
+# vLLM: `vllm bench latency --batch-size`. These measure DIFFERENT boundaries per backend and
+# are reported as not cross-comparable -- compare each to its own online number instead.
+offline:
+  batch_size: [1, 4, 16]
+  n_prompt: [512]
+  n_gen: [128]
+  reps: 3
+  shared_prompt: false
+  # throughput_prompts: [200]   # vLLM only: `vllm bench throughput --num-prompts`
+
+# ---------------------------------------------------------------- what "best" means
+objective:
+  metric: total_token_throughput
+  goal: max
+  src: client
+
+constraints:
+  - metric: ttft_ms_p99
+    max: 5000
+  - metric: itl_ms_p95
+    max: 200
+
+startup_timeout_s: 900
+request_timeout_s: 600
+settle_s: 3
+continue_on_error: true

@@ -472,10 +472,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    subcommands = {"parity", "quality", "calibrate", "compare"}
+    subcommands = {"parity", "quality", "calibrate", "compare", "sweep"}
 
     if argv and argv[0] in subcommands:
         sub, rest = argv[0], argv[1:]
+        if sub == "sweep":
+            # The orchestrated path: llmbench manages the servers, their CPU/NUMA placement,
+            # multi-instance fleets and load balancing, rather than attaching to one endpoint.
+            from .suite.cli import main as sweep_main
+
+            return sweep_main(rest)
         if sub == "parity":
             p = argparse.ArgumentParser(prog="llmbench parity")
             p.add_argument("--a", required=True)
