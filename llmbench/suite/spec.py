@@ -19,6 +19,8 @@ Every axis accepts either a scalar or a list; scalars are promoted to single-ele
 from __future__ import annotations
 
 import dataclasses
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal
@@ -28,6 +30,11 @@ from .topology import SmtPolicy
 
 BackendName = Literal["llamacpp", "vllm"]
 BACKENDS: tuple[str, ...] = ("llamacpp", "vllm")
+_BACKEND_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _expand(value: Any) -> str:
+    return os.path.expanduser(str(value)) if value else ""
 
 
 class SpecError(ValueError):
@@ -161,9 +168,22 @@ class BackendSpec:
 
     Kept separate from the sweep axes because these are properties of the *installation*,
     not of the experiment.
+
+    `name` is the key under `backends:` and is what reports, config labels and
+    `deployment.backend` refer to. `type` is which engine it is (llamacpp | vllm) and is what
+    decides the launcher, the HTTP client and the offline tool. They coincide unless the spec
+    names a variant -- two llama.cpp builds, or one engine with two models:
+
+        backends:
+          llamacpp-zendnn-q8: {type: llamacpp, server_bin: ..., model: ...Q8_0.gguf}
+          vllm-w8a8:          {type: vllm, model: ...quantized.w8a8}
+
+    A variant is a separate installation, not a sweep axis over one, because its binary and
+    its weights differ: nothing about it can be varied by a flag on the same server.
     """
 
     name: str
+    type: str = ""                 # llamacpp | vllm; defaults to `name`
     model: str = ""
     served_model_name: str = ""
     server_bin: str = ""
@@ -173,30 +193,64 @@ class BackendSpec:
     offline_extra_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     base_port: int = 0
+    # Server axes this installation sweeps instead of the global `deployment:` values. For
+    # settings that are not comparable across engines anyway -- llama.cpp's `-c 32000` next
+    # to vLLM's `--max-model-len 8192` -- without crossing each value with every backend.
+    deployment: dict[str, list[int]] = field(default_factory=dict)
 
     _DEFAULT_PORT = {"llamacpp": 8100, "vllm": 8200}
+    OVERRIDABLE = ("n_ctx", "n_parallel", "batch", "ubatch", "threads_per_instance")
+
+    def __post_init__(self) -> None:
+        if not self.type:
+            self.type = self.name
 
     @classmethod
     def from_dict(cls, name: str, data: dict | None) -> "BackendSpec":
         data = data or {}
-        _unknown_keys(data, ("model", "served_model_name", "server_bin", "offline_bin",
+        _unknown_keys(data, ("type", "model", "served_model_name", "server_bin", "offline_bin",
                              "batched_bin", "extra_args", "offline_extra_args", "env",
-                             "base_port"), f"backends.{name}")
-        if name not in BACKENDS:
-            raise SpecError(f"backends: unknown backend {name!r}; known: {list(BACKENDS)}")
+                             "base_port", "deployment"), f"backends.{name}")
+        overrides_in = data.get("deployment") or {}
+        if not isinstance(overrides_in, dict):
+            raise SpecError(f"backends.{name}.deployment must be a mapping")
+        _unknown_keys(overrides_in, cls.OVERRIDABLE, f"backends.{name}.deployment")
+        overrides: dict[str, list[int]] = {}
+        for key, value in overrides_in.items():
+            values = _int_axis(value, f"backends.{name}.deployment.{key}")
+            if any(v < 1 for v in values):
+                raise SpecError(f"backends.{name}.deployment.{key}: every value must be >= 1")
+            overrides[key] = values
+        if not _BACKEND_NAME.fullmatch(name):
+            raise SpecError(f"backends: {name!r} is not a usable name; use letters, digits, "
+                            f"'-', '_' and '.' only")
+        kind = str(data.get("type", name))
+        if kind not in BACKENDS:
+            hint = ("" if "type" in data else
+                    f"; to name a variant, keep the key and add `type: llamacpp` or `type: vllm`")
+            raise SpecError(f"backends.{name}: unknown backend type {kind!r} "
+                            f"(known: {list(BACKENDS)}){hint}")
         env = {str(k): str(v) for k, v in (data.get("env") or {}).items()}
         return cls(
             name=name,
-            model=str(data.get("model", "")),
+            type=kind,
+            # Expanded here because nothing downstream does: argv goes to the server without
+            # a shell, so `~/models/x.gguf` would reach llama-server as a literal `~`.
+            model=_expand(data.get("model", "")),
             served_model_name=str(data.get("served_model_name", "")),
-            server_bin=str(data.get("server_bin", "")),
-            offline_bin=str(data.get("offline_bin", "")),
-            batched_bin=str(data.get("batched_bin", "")),
+            server_bin=_expand(data.get("server_bin", "")),
+            offline_bin=_expand(data.get("offline_bin", "")),
+            batched_bin=_expand(data.get("batched_bin", "")),
             extra_args=[str(a) for a in _as_list(data.get("extra_args"), "extra_args")],
             offline_extra_args=[str(a) for a in _as_list(data.get("offline_extra_args"), "offline_extra_args")],
             env=env,
-            base_port=int(data.get("base_port", cls._DEFAULT_PORT.get(name, 8100))),
+            base_port=int(data.get("base_port", cls._DEFAULT_PORT.get(kind, 8100))),
+            deployment=overrides,
         )
+
+    def axis(self, name: str, default: list):
+        """This installation's values for a server axis: its override, else the global."""
+        return list(self.deployment.get(name) or default)
 
     def model_label(self) -> str:
         """Short name for reports: the filename stem, not the whole path."""
@@ -223,8 +277,9 @@ class DeploymentAxes:
                  "cores_per_instance", "threads_per_instance")
         _unknown_keys(data, known, "deployment")
         axes = cls(
-            backend=_str_axis(data.get("backend"), "deployment.backend",
-                              default=["llamacpp"], choices=BACKENDS),
+            # Names, not types: any key under `backends:`. SuiteSpec.validate checks each one
+            # has a matching section.
+            backend=_str_axis(data.get("backend"), "deployment.backend", default=["llamacpp"]),
             instances=_int_axis(data.get("instances"), "deployment.instances", default=[1]),
             n_parallel=_int_axis(data.get("n_parallel"), "deployment.n_parallel", default=[1]),
             n_ctx=_int_axis(data.get("n_ctx"), "deployment.n_ctx", default=[4096]),
@@ -372,17 +427,30 @@ class ObjectiveSpec:
     goal: str = "max"                 # max | min
     src: str = "client"               # which measurement path the objective reads
     constraints: list[Constraint] = field(default_factory=list)
+    # A row that lost more than this share of its requests is not ranked. 0 means any lost
+    # request disqualifies: a config that drops requests has not delivered the throughput
+    # computed from the ones it kept.
+    max_error_pct: float = 0.0
+    # Rank rows flagged as contaminated (foreign CPU load, threads outside the allocation,
+    # lost requests) instead of excluding them. For diagnosing a noisy box, not for answers.
+    rank_flagged: bool = False
 
     @classmethod
     def from_dict(cls, data: dict | None, constraints: Any) -> "ObjectiveSpec":
         data = data or {}
-        _unknown_keys(data, ("metric", "goal", "src"), "objective")
+        _unknown_keys(data, ("metric", "goal", "src", "max_error_pct", "rank_flagged"),
+                      "objective")
         parsed = [Constraint.from_dict(c) for c in _as_list(constraints, "constraints")]
+        max_error_pct = float(data.get("max_error_pct", 0.0))
+        if not 0.0 <= max_error_pct <= 100.0:
+            raise SpecError("objective.max_error_pct must be between 0 and 100")
         return cls(
             metric=str(data.get("metric", "total_token_throughput")),
             goal=_one_of(data.get("goal"), "objective.goal", ("max", "min"), "max"),
             src=_one_of(data.get("src"), "objective.src", ("client", "server"), "client"),
             constraints=parsed,
+            max_error_pct=max_error_pct,
+            rank_flagged=bool(data.get("rank_flagged", False)),
         )
 
     def describe(self) -> str:
@@ -420,6 +488,10 @@ class SuiteSpec:
         known = ("name", "out_dir", "mode", "cpu", "lb", "backends", "deployment", "workload",
                  "offline", "objective", "constraints", "startup_timeout_s",
                  "request_timeout_s", "settle_s", "continue_on_error", "endpoint", "dry_run")
+        # Top-level `x-*` keys are ignored, as in docker-compose: they exist to hold YAML
+        # anchors (`x-llamacpp-env: &env {...}`) shared by several backends. Only the prefix
+        # is exempt, so a misspelt real key still fails.
+        data = {k: v for k, v in data.items() if not str(k).startswith("x-")}
         _unknown_keys(data, known, "spec")
 
         backends = {
@@ -502,13 +574,13 @@ class SuiteSpec:
         if self.mode in ("offline", "both"):
             for name in self.deployment.backend:
                 spec = self.backends[name]
-                if name == "llamacpp" and not (spec.offline_bin or spec.batched_bin):
+                if spec.type == "llamacpp" and not (spec.offline_bin or spec.batched_bin):
                     raise SpecError(
-                        "backends.llamacpp needs offline_bin (llama-bench) and/or batched_bin "
-                        "(llama-batched-bench) for offline mode"
+                        f"backends.{name} needs offline_bin (llama-bench) and/or batched_bin "
+                        f"(llama-batched-bench) for offline mode"
                     )
-                if name == "vllm" and not spec.offline_bin:
-                    raise SpecError("backends.vllm.offline_bin (the `vllm` binary) is required for offline mode")
+                if spec.type == "vllm" and not spec.offline_bin:
+                    raise SpecError(f"backends.{name}.offline_bin (the `vllm` binary) is required for offline mode")
         # A multi-instance deployment with no load balancer means the client has no defined
         # way to address the fleet; refuse rather than silently benchmarking instance 0 only.
         if self.lb.kind == "none" and max(self.deployment.instances, default=1) > 1:

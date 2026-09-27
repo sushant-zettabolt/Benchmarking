@@ -36,9 +36,9 @@ def make_backend(dep: DeploymentPlan, spec: SuiteSpec) -> Backend:
     the proxy. With `client` it is a FanoutBackend over every instance. Either way the runner
     sees one object and needs no knowledge of the fleet.
     """
-    cls = _BACKEND_CLASSES.get(dep.backend)
+    cls = _BACKEND_CLASSES.get(dep.backend_spec.type)
     if cls is None:
-        raise ValueError(f"no backend client for {dep.backend!r}")
+        raise ValueError(f"no backend client for type {dep.backend_spec.type!r} ({dep.backend})")
 
     if dep.lb_kind == "nginx":
         return cls(dep.client_url, None, spec.request_timeout_s)

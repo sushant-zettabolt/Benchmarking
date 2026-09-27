@@ -6,12 +6,11 @@ finished -- or one that was interrupted.
 """
 from __future__ import annotations
 
-import dataclasses
 import json
 from pathlib import Path
 from typing import Any
 
-from ..execute import TrialResult
+from ..execute import TrialResult, read_trials
 from ..objective import RankingReport, rank
 from ..spec import Constraint, ObjectiveSpec
 from .common import ReportContext
@@ -23,26 +22,9 @@ FORMATS = ("html", "md", "csv", "json")
 
 
 def _load_trials(path: Path) -> tuple[list[TrialResult], int]:
-    """Read trials.jsonl defensively. Returns (rows, n_unreadable).
-
-    Two things this must survive, because both happen to real runs. A row is flushed after
-    every trial, so a hard kill can leave the last line half-written -- losing one truncated
-    line must not cost the report the ninety complete ones above it. And a directory can hold
-    rows written by a different version of the harness, whose extra or missing keys would
-    otherwise make the constructor raise; unknown keys are dropped and absent ones default.
-    """
-    known = {f.name for f in dataclasses.fields(TrialResult)}
-    rows: list[TrialResult] = []
-    skipped = 0
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            obj = json.loads(line)
-            rows.append(TrialResult(**{k: v for k, v in obj.items() if k in known}))
-        except (ValueError, TypeError):
-            skipped += 1
-    return rows, skipped
+    """Read trials.jsonl defensively. Returns (rows, n_unreadable). See execute.read_trials,
+    which `--resume` shares so that both agree on what a readable row is."""
+    return read_trials(path)
 
 
 def reaggregate(out_dir: Path, results: list[TrialResult]) -> tuple[list[TrialResult], int]:
@@ -115,6 +97,10 @@ def load_context(out_dir: str | Path, *, from_records: bool = False) -> ReportCo
             Constraint(metric=c["metric"], max=c.get("max"), min=c.get("min"))
             for c in obj_data.get("constraints", [])
         ],
+        # Absent from manifests written before these existed; the defaults are the
+        # behaviour those runs are now re-rendered with.
+        max_error_pct=float(obj_data.get("max_error_pct", 0.0)),
+        rank_flagged=bool(obj_data.get("rank_flagged", False)),
     )
     n_reaggregated = 0
     if from_records:

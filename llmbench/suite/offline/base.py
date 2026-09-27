@@ -110,6 +110,7 @@ def run_tool(
     goes through `terminate_process_group`, which signals the group we created and nothing
     else (the same rule deploy.py follows: never pattern-match process names).
     """
+    from .. import procs
     from ..deploy import terminate_process_group
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,9 +120,12 @@ def run_tool(
     t0 = time.monotonic()
     proc: subprocess.Popen | None = None
     try:
-        proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-            start_new_session=True,
+        # Recorded in pids.json and set to die with the sweep, like every server (procs.py).
+        # Raises RunStopping once the sweep is stopping, so a multi-invocation tool
+        # (llama-batched-bench reps) cannot start its next rep after being told to stop.
+        proc = procs.start(
+            argv, name=log_path.stem, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env,
         )
     except OSError as e:
         rc, out, err = -1, "", f"[llmbench] failed to execute: {e}"
@@ -129,6 +133,7 @@ def run_tool(
         try:
             out, err = proc.communicate(timeout=timeout_s)
             rc = proc.returncode
+            procs.untrack(proc)
         except subprocess.TimeoutExpired:
             terminate_process_group(proc)
             out, err = _drain(proc)

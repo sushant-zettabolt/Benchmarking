@@ -58,6 +58,7 @@ class StubLive:
         self.processes: list = []
         self.lb_process = None
         self.affinity: list[dict] = []
+        self.launch_seconds = 0.0
         self.torn_down = False
 
     def to_dict(self): return {"processes": []}

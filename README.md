@@ -70,6 +70,8 @@ latency/throughput`) including static batch size.
 llmbench sweep plan --spec sweep.yaml     # resolve and print; launches nothing
 llmbench sweep run  --spec sweep.yaml     # execute, then write report.{html,md,csv,json}
 llmbench sweep report out/sweep-8b        # re-render reports from stored artifacts
+llmbench sweep run  --spec sweep.yaml --resume   # continue an interrupted run in place
+llmbench sweep cleanup out/sweep-8b       # stop servers a killed run left behind
 ```
 
 ```yaml
@@ -100,7 +102,7 @@ See **[docs/sweep.md](docs/sweep.md)** for the full schema and
 ## Commands
 
 - `llmbench [flags]` -- run a benchmark against one endpoint (the default/implicit command).
-- `llmbench sweep {plan,run,report}` -- the orchestrated framework above
+- `llmbench sweep {plan,run,report,cleanup}` -- the orchestrated framework above
   ([docs/sweep.md](docs/sweep.md)).
 - `llmbench parity --a <url> --b <url>` -- probe both servers, classify every parity axis
   (weights, KV dtype, context capacity, KV memory budget, batch shaping, attention backend,

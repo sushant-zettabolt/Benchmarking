@@ -81,6 +81,8 @@ objective:
   metric: total_token_throughput   # any metric column: ttft_ms_p99, itl_ms_p95, tps_mean, ...
   goal: max                        # max | min
   src: client                      # client = wall-clock, comparable. server = diagnostic only
+  max_error_pct: 0                 # rows that lost more than this % of requests are not ranked
+  rank_flagged: false              # true = also rank rows flagged for contention/misplacement/lost requests
 
 constraints:                       # a config failing any of these is infeasible
   - {metric: ttft_ms_p99, max: 5000}

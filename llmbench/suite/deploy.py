@@ -37,6 +37,7 @@ from typing import Any
 
 import httpx
 
+from . import procs
 from .plan import DeploymentPlan, InstancePlan
 from .spec import CpuSpec, SuiteSpec
 from .topology import CoreSet, format_cpu_list, parse_cpu_list
@@ -89,6 +90,13 @@ def terminate_process_group(proc: subprocess.Popen, *, timeout: float = 30.0) ->
     escalation on timeout, and `subprocess.run(timeout=...)` does NOT do it -- it kills only
     the direct child, which with `start_new_session=True` leaves every grandchild alive.
     """
+    try:
+        _signal_group(proc, timeout=timeout)
+    finally:
+        procs.untrack(proc)
+
+
+def _signal_group(proc: subprocess.Popen, *, timeout: float) -> None:
     if proc.poll() is not None:
         return
     try:
@@ -263,11 +271,13 @@ def vllm_server_argv(
 def build_server_command(
     dep: DeploymentPlan, inst: InstancePlan, cpu: CpuSpec,
 ) -> tuple[list[str], dict[str, str]]:
-    if dep.backend == "llamacpp":
+    # By engine type, not by name: `dep.backend` may be a named variant (llamacpp-zendnn-q8).
+    kind = dep.backend_spec.type
+    if kind == "llamacpp":
         return llamacpp_server_argv(dep, inst, cpu)
-    if dep.backend == "vllm":
+    if kind == "vllm":
         return vllm_server_argv(dep, inst, cpu)
-    raise DeploymentError(f"no server launcher for backend {dep.backend!r}")
+    raise DeploymentError(f"no server launcher for backend type {kind!r} ({dep.backend})")
 
 
 def health_url(dep: DeploymentPlan, inst: InstancePlan) -> str:
@@ -275,6 +285,21 @@ def health_url(dep: DeploymentPlan, inst: InstancePlan) -> str:
 
 
 # --- launching ---
+
+
+def _keep_previous_log(log_path: Path) -> None:
+    """Move an existing log aside rather than truncating it.
+
+    Deployment ids restart at d000 every run, so a resumed or repeated sweep relaunches into
+    the same log path -- and the log it would overwrite is usually the one explaining why the
+    previous attempt failed.
+    """
+    if not log_path.exists() or not log_path.stat().st_size:
+        return
+    n = 1
+    while (archived := log_path.with_name(f"{log_path.stem}.{n}{log_path.suffix}")).exists():
+        n += 1
+    log_path.rename(archived)
 
 
 def spawn(
@@ -285,20 +310,21 @@ def spawn(
     env = dict(os.environ)
     env.update(env_overrides)
 
-    log_f = open(log_path, "w")
+    _keep_previous_log(log_path)
     header = (
         f"# llmbench managed process: {name}\n"
         f"# argv: {shlex.join(argv)}\n"
         f"# env : {' '.join(f'{k}={v}' for k, v in sorted(env_overrides.items()))}\n"
         f"# cpus: {cores.physcpubind if cores else 'unpinned'}\n\n"
     )
-    log_f.write(header)
-    log_f.flush()
-
-    proc = subprocess.Popen(
-        argv, stdout=log_f, stderr=subprocess.STDOUT,
-        env=env, start_new_session=True,   # own process group, so teardown can killpg
-    )
+    with open(log_path, "w") as log_f:
+        log_f.write(header)
+        log_f.flush()
+        # Own session, so teardown can killpg; recorded in pids.json and set to die with
+        # this process, so a sweep killed outright does not strand it (see procs.py).
+        proc = procs.start(
+            argv, name=name, port=port, stdout=log_f, stderr=subprocess.STDOUT, env=env,
+        )
     return ManagedProcess(
         name=name, proc=proc, log_path=log_path, argv=argv,
         env_overrides=env_overrides, port=port, cores=cores,

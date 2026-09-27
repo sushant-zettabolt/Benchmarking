@@ -1,0 +1,180 @@
+# Llama 3.1 8B on 32 Turin cores (192-223, NUMA node 6): ZenDNN llama.cpp vs stock llama.cpp
+# vs vLLM, each at 16-bit weights (BF16) and 8-bit weights (Q8_0 for llama.cpp, W8A8 for vLLM).
+#
+# Settings follow the reference runs these numbers will be compared against:
+#   llama.cpp  numactl --physcpubind=192-223 --membind=6 llama-batched-bench
+#              -c 32000 -b 4096 -ub 4096 -t 32 -fa on --load-mode none
+#              LD_PRELOAD=tcmalloc:libomp  KMP_AFFINITY=granularity=fine,compact,1,0
+#              OMP_NUM_THREADS=32  ZENDNNL_MATMUL_ALGO=1
+#   vLLM       numactl --physcpubind=192-223 --membind=6 vllm bench latency
+#              --max-model-len 8192 --max-num-batched-tokens 4096 --dtype auto
+#              --kv-cache-dtype auto --enforce-eager --distributed-executor-backend mp
+#              --batch-size 1 --num-iters 3 --num-iters-warmup 1
+#              LD_PRELOAD=tcmalloc:libiomp5(venv)  VLLM_CPU_OMP_THREADS_BIND=192-223
+#              OMP_NUM_THREADS=32  VLLM_CPU_KVCACHE_SPACE=90  ZENDNNL_MATMUL_ALGO=1
+#              ZENDNNL_MATMUL_WEIGHT_CACHE=1  ZENDNNL_LRU_CACHE_CAPACITY=1024
+#
+# One difference is deliberate: the reference used each engine's *offline* tool; this sweep
+# runs each engine's *server* (llama-server, vllm serve) and times requests over HTTP. So the
+# numbers here include the HTTP + scheduler cost the offline tools do not have -- expect them
+# a little lower, most visibly at small pp where that fixed cost is a larger share.
+#
+# Six named variants, one single-instance deployment each, run one at a time:
+#   llamacpp-zendnn-bf16  llamacpp-zendnn-q8  llamacpp-bf16  llamacpp-q8  vllm-bf16  vllm-w8a8
+# Workload per variant: pp1..pp4096 (15 prefill tests, 1 generated token each, as with the
+# reference's -ntg 1 / --output-len 1) and tg128. 3 reps, 1 warm-up. 96 trials.
+#
+# Before running:
+#   grep -n REPLACE sweep.turin-32c-8b.yaml         # must print nothing
+#   <zendnn>/build_zendnn/bin/llama-server --help | grep -- --load-mode   # see note below
+#   llmbench sweep plan --spec sweep.turin-32c-8b.yaml
+#       - every deployment must show  cpus=192-223  membind=[6]
+# Run (survives the SSH session dropping; SIGHUP tears down cleanly):
+#   nohup llmbench sweep run --spec sweep.turin-32c-8b.yaml > sweep.log 2>&1 &
+# If it dies, continue where it stopped:
+#   llmbench sweep run --spec sweep.turin-32c-8b.yaml --resume
+
+name: turin-32c-llama31-8b
+out_dir: out/turin-32c-llama31-8b
+mode: online
+
+# ---------------------------------------------------------------- CPU placement
+# Produces `numactl --physcpubind=192-223 --membind=6`, as in the reference. For vLLM the
+# same list becomes VLLM_CPU_OMP_THREADS_BIND, and OMP_NUM_THREADS is set in env below.
+cpu:
+  budget: "192-223"
+  smt: exclude           # 192-223 are 32 physical cores; exclude keeps any sibling out
+  ccd_align: true        # 32 cores = 4 whole Zen 5 CCDs
+  membind: "6"           # explicit, as in the reference (auto would resolve to the same node)
+  numa_policy: membind
+
+lb:
+  kind: client           # single instance => no proxy, nothing extra in the timed window
+
+# ---------------------------------------------------------------- installations
+# Environment shared by both llama.cpp builds. The stock build gets the same allocator,
+# OpenMP runtime and affinity so the only difference between the pairs is ZenDNN itself.
+x-llamacpp-env: &llamacpp_env
+  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/usr/lib/x86_64-linux-gnu/libomp.so.5
+  KMP_AFFINITY: granularity=fine,compact,1,0
+  OMP_NUM_THREADS: "32"
+
+x-llamacpp-zendnn-env: &llamacpp_zendnn_env
+  <<: *llamacpp_env
+  ZENDNNL_MATMUL_ALGO: "1"
+
+# The reference's llama.cpp settings. -t 32 comes from the 32 allocated cores.
+x-llamacpp-deployment: &llamacpp_deployment
+  n_ctx: 32000           # -c 32000
+
+# `-fa on` for both builds. `--load-mode none` came from the ZenDNN build's reference command
+# and is not a flag stock llama.cpp is known to have, so it is on the ZenDNN variants only.
+# If `llama-server --help` in the ZenDNN build does not list it either, delete it here --
+# otherwise both ZenDNN deployments will fail to start.
+x-llamacpp-args: &llamacpp_args ["-fa", "on"]
+x-llamacpp-zendnn-args: &llamacpp_zendnn_args ["-fa", "on", "--load-mode", "none"]
+
+x-vllm-env: &vllm_env
+  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/proj/rdi/staff/sacsharm/vllm/.venv/lib/libiomp5.so
+  OMP_NUM_THREADS: "32"
+  VLLM_CPU_KVCACHE_SPACE: "90"
+  ZENDNNL_MATMUL_ALGO: "1"
+  ZENDNNL_MATMUL_WEIGHT_CACHE: "1"
+  ZENDNNL_LRU_CACHE_CAPACITY: "1024"
+  # VLLM_CPU_OMP_THREADS_BIND is set automatically from cpu.budget (192-223).
+
+x-vllm-args: &vllm_args
+  ["--dtype", "auto", "--kv-cache-dtype", "auto", "--enforce-eager",
+   "--distributed-executor-backend", "mp"]
+
+backends:
+  llamacpp-zendnn-bf16:
+    type: llamacpp
+    model: /REPLACE/with/Meta-Llama-3.1-8B-Instruct-BF16.gguf   # llama.cpp needs a GGUF, not the HF dir
+    served_model_name: llama3.1-8b-bf16
+    server_bin: /REPLACE/with/llama.cpp/build_zendnn/bin/llama-server
+    base_port: 8100
+    extra_args: *llamacpp_zendnn_args
+    env: *llamacpp_zendnn_env
+    deployment: *llamacpp_deployment
+
+  llamacpp-zendnn-q8:
+    type: llamacpp
+    model: ~/models/gguf/Llama-3.1-8B-Instruct-Q8_0.gguf
+    served_model_name: llama3.1-8b-q8_0
+    server_bin: /REPLACE/with/llama.cpp/build_zendnn/bin/llama-server
+    base_port: 8110
+    extra_args: *llamacpp_zendnn_args
+    env: *llamacpp_zendnn_env
+    deployment: *llamacpp_deployment
+
+  llamacpp-bf16:
+    type: llamacpp
+    model: /REPLACE/with/Meta-Llama-3.1-8B-Instruct-BF16.gguf
+    served_model_name: llama3.1-8b-bf16
+    server_bin: /REPLACE/with/llama.cpp/build/bin/llama-server   # the non-ZenDNN build
+    base_port: 8120
+    extra_args: *llamacpp_args
+    env: *llamacpp_env
+    deployment: *llamacpp_deployment
+
+  llamacpp-q8:
+    type: llamacpp
+    model: ~/models/gguf/Llama-3.1-8B-Instruct-Q8_0.gguf
+    served_model_name: llama3.1-8b-q8_0
+    server_bin: /REPLACE/with/llama.cpp/build/bin/llama-server   # the non-ZenDNN build
+    base_port: 8130
+    extra_args: *llamacpp_args
+    env: *llamacpp_env
+    deployment: *llamacpp_deployment
+
+  vllm-bf16:
+    type: vllm
+    model: /tmp/models/Meta-Llama-3.1-8B-Instruct
+    served_model_name: llama3.1-8b-bf16
+    # Inferred from the reference's VLLM_VENV_LIBOMP (/proj/rdi/staff/sacsharm/vllm/.venv).
+    server_bin: /proj/rdi/staff/sacsharm/vllm/.venv/bin/vllm
+    base_port: 8200
+    extra_args: *vllm_args
+    env: *vllm_env
+
+  vllm-w8a8:
+    type: vllm
+    model: /tmp/models/Meta-Llama-3.1-8B-Instruct-quantized.w8a8
+    served_model_name: llama3.1-8b-w8a8
+    server_bin: /proj/rdi/staff/sacsharm/vllm/.venv/bin/vllm
+    base_port: 8210
+    extra_args: *vllm_args
+    env: *vllm_env
+
+# ---------------------------------------------------------------- sweep axes
+# Global values are the vLLM reference settings; the llama.cpp variants override n_ctx above.
+deployment:
+  backend: [llamacpp-zendnn-bf16, llamacpp-zendnn-q8, llamacpp-bf16, llamacpp-q8,
+            vllm-bf16, vllm-w8a8]
+  instances: [1]
+  n_parallel: [1]        # one slot / --max-num-seqs 1: the reference's batch size 1
+  n_ctx: [8192]          # vLLM --max-model-len 8192
+  batch: [4096]          # llama.cpp -b 4096; vLLM --max-num-batched-tokens 4096
+  ubatch: [4096]         # llama.cpp -ub 4096 (vLLM has no equivalent)
+
+workload:
+  # The pp list asked for. The reference also ran 384, 768 and 1536; add them here to match.
+  n_prompt: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 512, 1024, 2048, 3072, 4096]
+  n_gen: [128]
+  concurrency: [1]
+  reps: 3                # --num-iters 3
+  warmup_fixed: 1        # --num-iters-warmup 1
+
+# ---------------------------------------------------------------- what "best" means
+# Read `best_per_test` in the report, not the single `best` row: the winner at pp1 and at
+# pp4096 is very likely a different variant, and `best` alone hides that.
+objective:
+  metric: tps_mean
+  goal: max
+  src: client
+
+startup_timeout_s: 1800  # vLLM on CPU loads weights and builds its engine; give it room
+request_timeout_s: 900
+settle_s: 10             # let page cache and memory settle between variants
+continue_on_error: true  # a variant that fails to start is recorded; the rest still run

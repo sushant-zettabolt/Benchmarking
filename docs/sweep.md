@@ -11,6 +11,8 @@ llmbench sweep plan   --spec sweep.yaml          # resolve and print; launches n
 llmbench sweep run    --spec sweep.yaml          # execute
 llmbench sweep run    --spec sweep.yaml --dry-run
 llmbench sweep report out/sweep-8b               # re-render reports from artifacts
+llmbench sweep run    --spec sweep.yaml --resume # continue an interrupted run in place
+llmbench sweep cleanup out/sweep-8b [--dry-run]  # stop servers a killed run left behind
 ```
 
 Start from [`sweep.example.yaml`](../sweep.example.yaml).
@@ -33,6 +35,43 @@ does. This is the same rationale as `config.NESTING_ORDER` in the single-endpoin
 
 Both accept scalars, lists, or llama-bench range syntax: `instances: 4`, `instances: [1,2,4]`
 and `instances: "1-8*2"` are all valid.
+
+### Backend variants
+
+A key under `backends:` is a **name**; `type:` says which engine it is. Leave `type` out and
+the key must itself be `llamacpp` or `vllm`, which is every spec written before variants. Name
+several installations of one engine to compare builds or weights in one run and one table:
+
+```yaml
+backends:
+  llamacpp-zendnn-q8: {type: llamacpp, server_bin: /opt/zendnn/llama-server, model: ~/m/q8.gguf}
+  llamacpp-q8:        {type: llamacpp, server_bin: /opt/stock/llama-server,  model: ~/m/q8.gguf}
+  vllm-w8a8:          {type: vllm,     server_bin: .venv/bin/vllm, model: /tmp/m/w8a8}
+deployment:
+  backend: [llamacpp-zendnn-q8, llamacpp-q8, vllm-w8a8]
+```
+
+The type decides the launcher, the HTTP client and the offline tool. The name is what rows,
+config labels and the ranking show, so two llama.cpp builds never merge into one `llamacpp`
+config. `~` in `model` and `*_bin` paths is expanded; argv reaches the server without a
+shell, so nothing else would expand it. [`sweep.turin-32c-8b.yaml`](../sweep.turin-32c-8b.yaml)
+is a worked example with six variants.
+
+A backend can give its own values for the server axes `n_ctx`, `n_parallel`, `batch`,
+`ubatch` and `threads_per_instance`. These *replace* the global `deployment:` values for that
+backend rather than being crossed with them. Use this for settings with no common meaning
+across engines, such as llama.cpp at `-c 32000` next to vLLM at `--max-model-len 8192`:
+
+```yaml
+backends:
+  llamacpp-q8: {type: llamacpp, ..., deployment: {n_ctx: 32000}}
+deployment:
+  n_ctx: [8192]        # everyone else
+```
+
+Rows record the value each server was actually launched with. Top-level keys starting with
+`x-` are ignored, as in docker-compose. They exist to hold YAML anchors shared by several
+backends (`x-llamacpp-env: &env {...}`, then `env: *env`).
 
 ---
 
@@ -251,16 +290,30 @@ want when the constraints turn out too tight or too loose to be interesting. If 
 feasible, the report says so and still shows the front and per-test winners so the trade-off
 stays visible.
 
+**Untrustworthy rows are not ranked.** An `ok` row is excluded from every answer above --
+it stays in the results table, and a note names it and why -- when any of these holds:
+
+- foreign CPU load on its cores reached `CONTENTION_WARN_PCT` (15%);
+- a server thread was pinned outside the deployment's allocation;
+- it lost more than `objective.max_error_pct` of its requests (default `0`: any lost request
+  disqualifies, because throughput computed from the requests a config kept is not
+  throughput it delivered).
+
+These are read from each row's `provenance`, so `sweep report` applies them to old runs too.
+`objective.rank_flagged: true` ranks them anyway, for diagnosing a noisy box.
+
 ---
 
 ## Artifacts
 
 ```
 out/<name>/
-  run.json          manifest: spec, env, topology, objective, counts, timings
+  run.json          manifest: status, spec, env, topology, objective, counts, timings
   plan.json         the fully-resolved plan — every port, core list and membind node
   deployments.json  what actually launched, incl. per-thread affinity verification
   trials.jsonl      one JSON row per measured result, appended as it completes
+  events.jsonl      timestamped log of every launch, trial, warning, stop and resume
+  pids.json         every process the run started and has not yet seen exit
   offline.jsonl     native-tool rows with their argv, env and parsed output
   records/<dep>.jsonl   raw per-request records
   llmbench.db       the same raw records in SQLite
@@ -292,9 +345,62 @@ between re-rendering a stored answer and re-deriving it. The one thing it cannot
 value that was already wrong *in* the raw record — for that the run has to be repeated.
 
 Pointing a second run at an `out_dir` that already holds results renames the old
-`trials.jsonl`/`offline.jsonl` to `trials.<previous-run-id>.jsonl` first, so the report
-describes one sweep rather than silently splicing two. Every row also carries its own
-`run_id`.
+`trials.jsonl`/`offline.jsonl`/`deployments.json` to `<file>.<previous-run-id>.<ext>` first,
+so the report describes one sweep rather than silently splicing two. Server logs are never
+truncated either: a relaunch into an existing `server-i0.log` moves it to `server-i0.1.log`.
+Every row also carries its own `run_id`.
+
+`run.json`'s `status` records how the run ended:
+
+| status | meaning |
+|---|---|
+| `running` | in progress -- or, if nothing is writing to the directory, killed too hard to record anything (SIGKILL, power loss). Check `pids.json` / `sweep cleanup` |
+| `finished` | every planned unit ran (some may still be `error` rows) |
+| `interrupted` | stopped by a signal; `stop_reason` says which. Servers were torn down and reports written |
+| `failed` | an exception ended it (`continue_on_error: false`, or a harness bug); `error` and `traceback` say what. Reports were still written |
+
+## Stopping, resuming, and cleaning up
+
+**SIGINT, SIGTERM and SIGHUP all stop the run in an orderly way:** the trial in flight is
+abandoned, the live fleet is torn down, and the reports are written from whatever was
+measured. SIGHUP matters most -- it is what an overnight run gets when the SSH session it
+was started from drops. A second signal does not interrupt the teardown the first one
+started.
+
+**Resume** continues the run recorded in `out_dir`, under the same `run_id`:
+
+```bash
+llmbench sweep run --spec sweep.yaml --resume
+```
+
+Units that finished (`ok` or `capacity`) are kept, and a deployment whose workloads are all
+done is not relaunched. Units with an `error` or `skipped` row, and the one the run died
+inside, are measured again. The previous `trials.jsonl` is archived as
+`trials.<run-id>.attempt<N>.jsonl` before its superseded rows are dropped. Raw records of
+later attempts carry an attempt-qualified `run_id`, so `report --from-records` never pools
+a failed attempt's requests with the retry's.
+
+Resume is refused if the spec now describes different measurements: `run.json` stores a
+fingerprint of every trial, port, core list, the host topology, and every launch and
+workload setting. Timeouts, `settle_s`, `continue_on_error`, the objective and the name may
+change between attempts. Raising `startup_timeout_s` after a slow load failed is the usual
+reason to resume.
+
+**If the sweep process itself is killed** (SIGKILL, OOM killer), no `finally` runs. Two
+things still cover it. On Linux every server and offline tool is started with
+`PR_SET_PDEATHSIG`, so the kernel sends it SIGTERM when the sweep dies. That reaches the
+direct child only, not grandchildren such as vLLM's engine core. So every launch is also
+recorded in `pids.json`, with its kernel start time, and
+
+```bash
+llmbench sweep cleanup out/sweep-8b --dry-run   # list what is still alive
+llmbench sweep cleanup out/sweep-8b             # SIGTERM, then SIGKILL after 30s
+```
+
+stops exactly those processes. A process counts as ours only if it has the recorded PID
+*and* start time, or belongs to the session the run created and started after its leader,
+so a reused PID is never signalled. A new run in the same `out_dir` refuses to start while a
+previous run's processes are alive, or while another sweep is still running there.
 
 ### What a row's `status` means
 
@@ -312,7 +418,8 @@ describes one sweep rather than silently splicing two. Every row also carries it
 This host carries a long-running `llama-server` on port 18080 belonging to another session.
 Two rules keep sweeps away from it:
 
-1. **Only PIDs we started are ever signalled.** Teardown goes through a real `Popen` handle
+1. **Only PIDs we started are ever signalled.** `sweep cleanup` works from the `pids.json` ledger and
+   verifies each PID's start time, never a process name. Teardown goes through a real `Popen` handle
    and signals the process *group* (vLLM's engine core is a separate process; signalling only
    the leader orphans it and leaves the port bound). There is no `pkill`-by-name anywhere in
    the codebase — `pkill -f llama-server` would kill the other session's server. This applies

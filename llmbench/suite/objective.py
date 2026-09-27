@@ -27,7 +27,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .execute import STATUS_OK, TrialResult
+from .execute import CONTENTION_WARN_PCT, STATUS_OK, TrialResult
 from .spec import Constraint, ObjectiveSpec
 
 
@@ -59,6 +59,7 @@ class Candidate:
     metrics: dict[str, Any] = field(default_factory=dict)
     config_key: tuple = ()
     config_label: str = ""
+    issues: list[str] = field(default_factory=list)   # see quality_issues()
 
     @property
     def feasible(self) -> bool:
@@ -75,6 +76,7 @@ class Candidate:
             "config_label": self.config_label, "axes": self.axes, "value": self.value,
             "feasible": self.feasible,
             "verdicts": [v.to_dict() for v in self.verdicts],
+            "issues": list(self.issues),
             "metrics": self.metrics,
         }
 
@@ -122,6 +124,31 @@ def evaluate_constraints(metrics: dict[str, Any], constraints: Iterable[Constrai
     return out
 
 
+def quality_issues(r: TrialResult, objective: ObjectiveSpec) -> list[str]:
+    """Reasons a successful row's number is not trustworthy enough to be *the answer*.
+
+    Each of these was already detected and written onto the row as a warning, and the
+    ranking used to ignore every one of them: a trial measured while another user's job held
+    half its cores, or one that kept 1 request of 40, could win `best`. Read from provenance
+    rather than from warning text, so re-rendering an old run applies the same test.
+    """
+    issues: list[str] = []
+    prov = r.provenance or {}
+    foreign = (prov.get("contention") or {}).get("foreign_pct")
+    if isinstance(foreign, (int, float)) and foreign >= CONTENTION_WARN_PCT:
+        issues.append(f"{foreign:.0f}% foreign CPU load on its cores")
+    stray = (prov.get("placement") or {}).get("threads_on_other_cpus")
+    if stray:
+        issues.append(f"{stray} server thread(s) pinned outside the allocation")
+    n_records, n_errors = prov.get("n_records"), prov.get("n_errors")
+    if n_records and n_errors:
+        pct = 100.0 * n_errors / n_records
+        if pct > objective.max_error_pct:
+            issues.append(f"{n_errors} of {n_records} request(s) failed ({pct:.0f}% > "
+                          f"max_error_pct {objective.max_error_pct:g}%)")
+    return issues
+
+
 def build_candidates(results: list[TrialResult], objective: ObjectiveSpec) -> list[Candidate]:
     """Score every successful row whose measurement path matches the objective.
 
@@ -143,6 +170,7 @@ def build_candidates(results: list[TrialResult], objective: ObjectiveSpec) -> li
             verdicts=evaluate_constraints(r.metrics, objective.constraints),
             metrics=dict(r.metrics),
             config_key=config_key(r.axes), config_label=config_label(r.axes),
+            issues=quality_issues(r, objective),
         ))
     return out
 
@@ -186,6 +214,7 @@ class RankingReport:
     best_overall: ConfigScore | None = None
     config_scores: list[ConfigScore] = field(default_factory=list)
     pareto: list[Candidate] = field(default_factory=list)
+    excluded: list[Candidate] = field(default_factory=list)   # flagged; see quality_issues
     n_feasible: int = 0
     n_infeasible: int = 0
     notes: list[str] = field(default_factory=list)
@@ -201,6 +230,7 @@ class RankingReport:
             "best_overall": self.best_overall.to_dict() if self.best_overall else None,
             "config_scores": [c.to_dict() for c in self.config_scores],
             "pareto": [c.to_dict() for c in self.pareto],
+            "excluded": [c.to_dict() for c in self.excluded],
             "notes": list(self.notes),
         }
 
@@ -216,12 +246,31 @@ class RankingReport:
 
 def rank(results: list[TrialResult], objective: ObjectiveSpec) -> RankingReport:
     candidates = build_candidates(results, objective)
+    flagged = [c for c in candidates if c.issues]
+    excluded: list[Candidate] = []
+    if flagged and not objective.rank_flagged:
+        excluded = flagged
+        candidates = [c for c in candidates if not c.issues]
     report = RankingReport(
         objective=objective.describe(), metric=objective.metric,
-        goal=objective.goal, src=objective.src, candidates=candidates,
+        goal=objective.goal, src=objective.src, candidates=candidates, excluded=excluded,
     )
+    if flagged:
+        shown = "; ".join(f"{c.trial_id} ({', '.join(c.issues)})" for c in flagged[:10])
+        more = f"; and {len(flagged) - 10} more" if len(flagged) > 10 else ""
+        report.notes.append(
+            f"{len(flagged)} row(s) were excluded from the ranking as untrustworthy: "
+            f"{shown}{more}. They are still in the results table; set "
+            f"`objective.rank_flagged: true` to rank them anyway"
+            if excluded else
+            f"{len(flagged)} flagged row(s) are ranked because objective.rank_flagged is set: "
+            f"{shown}{more}"
+        )
     if not candidates:
         report.notes.append(
+            "every successful row was excluded as untrustworthy, so nothing was ranked; "
+            "fix the cause (usually contention -- check provenance.contention) and re-run"
+            if excluded else
             f"no successful rows with src={objective.src!r} carried a numeric "
             f"{objective.metric!r}; check the metric name against trials.jsonl"
         )
@@ -353,4 +402,4 @@ def _pareto_front(candidates: list[Candidate], objective: ObjectiveSpec) -> list
 
 
 __all__ = ["rank", "RankingReport", "Candidate", "ConfigScore", "ConstraintVerdict",
-           "build_candidates", "evaluate_constraints", "config_label"]
+           "build_candidates", "evaluate_constraints", "config_label", "quality_issues"]

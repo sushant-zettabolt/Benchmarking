@@ -11,6 +11,8 @@ live deployment.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -99,6 +101,7 @@ class DeploymentPlan:
         return {
             "id": self.id,
             "axes": self.axes(),
+            "backend_type": self.backend_spec.type,
             "model": self.backend_spec.model,
             "model_label": self.backend_spec.model_label(),
             "client_url": self.client_url,
@@ -220,6 +223,34 @@ class SweepPlan:
             "warnings": list(self.warnings),
         }
 
+    def fingerprint(self) -> str:
+        """Identity of what this plan *measures*, so `sweep run --resume` can refuse to splice
+        rows from two different experiments into one table.
+
+        Covers every trial, port and core list, the host topology, and every spec field that
+        changes what a server is launched with or what a client sends. Deliberately leaves
+        out what can legitimately change between attempts without changing a measurement:
+        timeouts, `settle_s`, `continue_on_error`, the objective (it only affects ranking),
+        the sweep name and `out_dir`. Raising `startup_timeout_s` after a slow model failed
+        to come up is the commonest reason to resume at all.
+        """
+        plan = self.to_dict()
+        for volatile in ("name", "objective", "warnings"):
+            plan.pop(volatile, None)
+        s = self.spec
+        body = {
+            "plan": plan,
+            "backends": {k: dataclasses.asdict(v) for k, v in sorted(s.backends.items())},
+            "workload": dataclasses.asdict(s.workload),
+            "offline": dataclasses.asdict(s.offline),
+            "cpu": dataclasses.asdict(s.cpu),
+            "lb": dataclasses.asdict(s.lb),
+            "endpoint": s.endpoint,
+            "mode": s.mode,
+        }
+        blob = json.dumps(body, sort_keys=True, default=str).encode()
+        return hashlib.sha256(blob).hexdigest()[:16]
+
 
 def _cartesian(axes: list[list]) -> Iterator[tuple]:
     if not axes:
@@ -259,6 +290,23 @@ def _expand_workloads(spec: SuiteSpec) -> list[WorkloadPlan]:
     return out
 
 
+def _deployment_points(spec: SuiteSpec, cores_axis: list[int | None]) -> Iterator[tuple]:
+    """Every (backend, instances, cores, n_ctx, n_parallel, batch, ubatch, threads) point.
+
+    Backend outermost, as before; within each backend, its own `backends.<name>.deployment`
+    overrides replace the global axis values rather than being crossed with them.
+    """
+    d = spec.deployment
+    for backend in d.backend:
+        b = spec.backends[backend]
+        threads = b.axis("threads_per_instance", d.threads_per_instance) or [None]
+        for rest in _cartesian([
+            d.instances, cores_axis, b.axis("n_ctx", d.n_ctx), b.axis("n_parallel", d.n_parallel),
+            b.axis("batch", d.batch), b.axis("ubatch", d.ubatch), threads,
+        ]):
+            yield (backend, *rest)
+
+
 def _port_base(spec: SuiteSpec, backend: str) -> int:
     return spec.backends[backend].base_port
 
@@ -271,14 +319,13 @@ def build_plan(spec: SuiteSpec, topo: Topology | None = None) -> SweepPlan:
     d = spec.deployment
 
     cores_axis: list[int | None] = list(d.cores_per_instance) or [None]
-    threads_axis: list[int | None] = list(d.threads_per_instance) or [None]
 
     workloads = _expand_workloads(spec) if spec.mode in ("online", "both") else []
 
     if spec.mode in ("online", "both"):
         dep_idx = 0
-        for backend, n_inst, cpi, n_ctx, n_par, batch, ubatch, threads in _cartesian(
-            [d.backend, d.instances, cores_axis, d.n_ctx, d.n_parallel, d.batch, d.ubatch, threads_axis]
+        for backend, n_inst, cpi, n_ctx, n_par, batch, ubatch, threads in _deployment_points(
+            spec, cores_axis,
         ):
             try:
                 alloc = allocate(
@@ -445,7 +492,7 @@ def _build_offline(spec: SuiteSpec, topo: Topology, plan: SweepPlan) -> list[Off
     for backend in spec.deployment.backend:
         bspec = spec.backends[backend]
         for batch_size, n_prompt, n_gen in _cartesian([o.batch_size, o.n_prompt, o.n_gen]):
-            tool = _offline_tool(backend, bspec, batch_size)
+            tool = _offline_tool(bspec.type, bspec, batch_size)
             if tool is None:
                 plan.warnings.append(
                     f"offline: no tool available for backend={backend} at batch_size="
@@ -459,7 +506,7 @@ def _build_offline(spec: SuiteSpec, topo: Topology, plan: SweepPlan) -> list[Off
             ))
             idx += 1
         for num_prompts in o.throughput_prompts:
-            if backend != "vllm":
+            if bspec.type != "vllm":
                 plan.warnings.append(
                     f"offline.throughput_prompts only applies to vllm "
                     f"(`vllm bench throughput`); ignored for backend={backend}"
@@ -475,20 +522,20 @@ def _build_offline(spec: SuiteSpec, topo: Topology, plan: SweepPlan) -> list[Off
     return out
 
 
-def _offline_tool(backend: str, bspec: BackendSpec, batch_size: int) -> str | None:
+def _offline_tool(backend_type: str, bspec: BackendSpec, batch_size: int) -> str | None:
     """Pick the native tool that can express this batch size.
 
     llama-bench has no request-batch concept at all -- it drives a single sequence -- so any
     batch_size > 1 must go to llama-batched-bench (`-npl`). At batch_size == 1 either works;
     llama-bench is preferred because it is the canonical, most-cited llama.cpp number.
     """
-    if backend == "llamacpp":
+    if backend_type == "llamacpp":
         if batch_size > 1:
             return "llama-batched-bench" if bspec.batched_bin else None
         if bspec.offline_bin:
             return "llama-bench"
         return "llama-batched-bench" if bspec.batched_bin else None
-    if backend == "vllm":
+    if backend_type == "vllm":
         return "vllm-latency" if bspec.offline_bin else None
     return None
 
