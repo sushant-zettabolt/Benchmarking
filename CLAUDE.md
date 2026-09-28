@@ -241,8 +241,12 @@ variant known to be broken without the user's go-ahead.
 
 ## Step 5 — the full run
 
+Use the script; it repeats steps 1-4's checks, runs the smoke spec, and starts the full run only
+if every smoke row is ok (README, "Running the Turin sweep"):
+
 ```bash
-nohup llmbench sweep run --spec sweep.turin-32c-8b.yaml > sweep.log 2>&1 &
+nohup scripts/run_turin_sweep.sh > sweep-turin.log 2>&1 < /dev/null &
+# resume after a crash:  scripts/run_turin_sweep.sh resume
 ```
 
 SIGINT, SIGTERM and SIGHUP all stop it cleanly: the live servers are torn down and reports
@@ -263,7 +267,7 @@ jq '{status, error, attempt, counts}' out/turin-32c-llama31-qwen36/run.json
    example SIGKILL or the OOM killer.
 2. Run `llmbench sweep cleanup out/turin-32c-llama31-qwen36 --dry-run`. If it lists anything,
    run it again without `--dry-run`.
-3. Continue with `llmbench sweep run --spec sweep.turin-32c-8b.yaml --resume`. Finished trials
+3. Continue with `scripts/run_turin_sweep.sh resume`. Finished trials
    are kept; failed and unfinished ones are redone.
 
 You may change only the timeouts, `settle_s`, `continue_on_error` or the objective between

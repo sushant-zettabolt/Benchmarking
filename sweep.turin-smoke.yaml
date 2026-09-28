@@ -64,14 +64,9 @@
 # Workload per variant: pp1..pp4096 (18 prefill tests, 1 generated token each, as with the
 # reference's -ntg 1 / --output-len 1) and tg128. 3 reps, 1 warm-up. 228 trials.
 #
-# Before running:
-#   grep -n REPLACE sweep.turin-32c-8b.yaml         # must print nothing
-#   llmbench sweep plan --spec sweep.turin-32c-8b.yaml
-#       - every deployment must show  cpus=160-191  membind=[5]
-# Run (survives the SSH session dropping; SIGHUP tears down cleanly):
-#   nohup llmbench sweep run --spec sweep.turin-32c-8b.yaml > sweep.log 2>&1 &
-# If it dies, continue where it stopped:
-#   llmbench sweep run --spec sweep.turin-32c-8b.yaml --resume
+# Run it with scripts/run_turin_sweep.sh (see README, "Running the Turin sweep"): it checks
+# the pod, the files and the plan, runs sweep.turin-smoke.yaml, and starts this full run only
+# if every smoke row is ok. If the full run dies: scripts/run_turin_sweep.sh resume
 
 name: turin-smoke
 out_dir: out/turin-smoke
@@ -269,3 +264,4 @@ startup_timeout_s: 3600  # 67 GB of Qwen BF16 over NFS; the 16 GB Llama GGUF too
 request_timeout_s: 900
 settle_s: 10             # let page cache and memory settle between variants
 continue_on_error: true  # a variant that fails to start is recorded; the rest still run
+core_sample_interval_s: 0.25  # per-core cpu time series -> cores/<deployment>.csv

@@ -99,6 +99,76 @@ See **[docs/sweep.md](docs/sweep.md)** for the full schema and
 - **Only PIDs it started are ever signalled**, and target ports are checked free before
   anything is torn down — this machine has other people's servers on it.
 
+## Running the Turin sweep
+
+[`sweep.turin-32c-8b.yaml`](sweep.turin-32c-8b.yaml) compares ZenDNN llama.cpp, stock
+llama.cpp and vLLM at 16-bit and 8-bit weights (BF16 / Q8_0 / W8A8), for Llama 3.1 8B and
+Qwen3.6-35B-A3B: 12 variants × 19 tests (pp1…pp4096, tg128) × 3 reps + 1 warm-up = 228 trials,
+each a single server pinned to cores 160-191 / NUMA node 5 of `turin-xcovoid0021-pod-5`.
+[`scripts/run_turin_sweep.sh`](scripts/run_turin_sweep.sh) runs it deterministically: it stops
+at the first failed check and only starts the full run after a smoke run in which every variant
+started and measured.
+
+| step | check |
+|---|---|
+| 1 | this process's cpuset is exactly `160-191` (the right pod) |
+| 2 | `pytest` passes |
+| 3 | every model, server binary and `LD_PRELOAD` library in the spec exists |
+| 4 | no server from an earlier run is alive; cores 160-191 are < 15% busy |
+| 5 | the plan is exactly 12 deployments / 228 trials, all on `cpus=160-191 membind=[5]` |
+| 6 | smoke run (`sweep.turin-smoke.yaml`, pp16 + tg16 per variant): all 24 rows `ok`, none < 1 t/s |
+| 7 | the full run |
+
+The checkout at `/proj/aigstaff/sohroy/Benchmarking` is on shared NFS: the workstation and
+the pod see the same files, so update it (`git pull`) wherever you have GitHub access, then run.
+The commit that ran is recorded in `run.json` (`host_info.llmbench_commit`).
+
+**From the workstation** (non-interactive; `kubectl` is not on `PATH` there):
+
+```bash
+K="/usr/local/bin/kubectl exec turin-xcovoid0021-pod-5 -n zendnn --"
+$K runuser -l sohroy -c 'cd /proj/aigstaff/sohroy/Benchmarking &&
+  nohup scripts/run_turin_sweep.sh > sweep-turin.log 2>&1 < /dev/null & echo pid $!'
+```
+
+**Or inside the pod** (`kubectl exec -it turin-xcovoid0021-pod-5 -n zendnn -- login sohroy`):
+
+```bash
+cd /proj/aigstaff/sohroy/Benchmarking
+python3 -m venv .venv && .venv/bin/pip install -e '.[test]'     # first time only
+nohup scripts/run_turin_sweep.sh > sweep-turin.log 2>&1 < /dev/null &
+```
+
+`scripts/run_turin_sweep.sh smoke` stops after step 6; `full` skips the smoke run.
+
+**Watch it:**
+
+```bash
+tail -f sweep-turin.log                                        # the script's own steps
+tail -f out/turin-32c-llama31-qwen36/events.jsonl              # every launch, trial, warning
+jq '{status, error, attempt, counts}' out/turin-32c-llama31-qwen36/run.json
+```
+
+**Stop it:** `kill <pid>` once, with the pid from `out/turin-32c-llama31-qwen36/run.json`
+(SIGINT/SIGTERM/SIGHUP tear the live server down and write reports from what was measured).
+Never kill servers by name; other people's servers run on this machine.
+
+**If it dies:** `llmbench sweep cleanup out/turin-32c-llama31-qwen36` (only signals PIDs this
+run recorded), then `scripts/run_turin_sweep.sh resume` — finished trials are kept, failed and
+unfinished ones redone. Only timeouts, `settle_s`, `continue_on_error`,
+`core_sample_interval_s` and the objective may change between attempts.
+
+**Results** (`out/turin-32c-llama31-qwen36/`):
+
+| file | contents |
+|---|---|
+| `report.md`, `report.html` | ranking, per-test winners, full table, host/pod details, the exact server command of every deployment |
+| `report.csv` | one row per trial and source (`src=client` is the comparable one): mean t/s, prefill t/s, decode t/s, TTFT, ITL, TPOT, e2e, … and the `server cmd` |
+| `report_reps.csv` | every measured repetition of every trial (3 per test), not only the mean |
+| `cores/<deployment>.csv` | per-core busy % of cores 160-191 every 250 ms, labelled by trial and phase (idle / warmup / rep N), with server / harness / foreign load split |
+| `best.json` | the winner per test and overall |
+| `run.json`, `deployments.json`, `records/`, `logs/` | host and software versions, launch commands, raw per-request records, server logs |
+
 ## Commands
 
 - `llmbench [flags]` -- run a benchmark against one endpoint (the default/implicit command).
