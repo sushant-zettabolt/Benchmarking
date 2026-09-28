@@ -114,6 +114,7 @@ started and measured.
 | 1 | this process's cpuset is exactly `160-191` (the right pod) |
 | 2 | `pytest` passes |
 | 3 | every model, server binary and `LD_PRELOAD` library in the spec exists |
+| 3b | each llama.cpp build loads its libggml/libllama/libzendnnl from its own `LD_LIBRARY_PATH` copy, not sacsharm's live tree |
 | 4 | no server from an earlier run is alive; cores 160-191 are < 15% busy |
 | 5 | the plan is exactly 12 deployments / 228 trials, all on `cpus=160-191 membind=[5]` |
 | 6 | smoke run (`sweep.turin-smoke.yaml`, pp16 + tg16 per variant): all 24 rows `ok`, none < 1 t/s |

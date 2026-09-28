@@ -85,13 +85,21 @@ lb:
   kind: client           # single instance => no proxy, nothing extra in the timed window
 
 # ---------------------------------------------------------------- installations
+# The copied llama-server binaries carry a build-time RUNPATH into sacsharm's live build trees
+# (/proj/rdi/staff/sacsharm/llama.cpp/{build_release,build_zendnn}/bin and his ZenDNN install),
+# so without LD_LIBRARY_PATH every libggml/libllama/libzendnnl would load from there -- and a
+# rebuild of his tree mid-sweep would silently change the code under test. LD_LIBRARY_PATH
+# takes precedence over RUNPATH and points each build at its own copies (byte-identical to
+# his as of 2026-09-28). scripts/run_turin_sweep.sh checks nothing resolves outside them.
 x-llamacpp-env: &llamacpp_env
   LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/proj/rdi/staff/sohroy/lib/libomp.so.5
+  LD_LIBRARY_PATH: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build/bin
   KMP_AFFINITY: granularity=fine,compact,1,0
   OMP_NUM_THREADS: "32"
 
 x-llamacpp-zendnn-env: &llamacpp_zendnn_env
   <<: *llamacpp_env
+  LD_LIBRARY_PATH: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build_zendnn/bin:/proj/rdi/staff/sohroy/llama.cpp-sacsharm/zendnnl/lib
   ZENDNNL_MATMUL_ALGO: "1"
 
 x-llamacpp-deployment: &llamacpp_deployment

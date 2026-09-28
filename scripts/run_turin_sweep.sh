@@ -61,6 +61,32 @@ print("\n".join(missing) or f"all files present for {len(spec.deployment.backend
 sys.exit(1 if missing else 0)
 EOF
 
+# ---- 3b. each llama.cpp build loads only its own libraries ---------------------------------
+# The copied binaries' RUNPATH points into sacsharm's live build tree; the spec's
+# LD_LIBRARY_PATH must win for every llama.cpp/ggml/ZenDNN library, or a rebuild of his tree
+# would change the code under test mid-sweep.
+"$PY" - "$SPEC" <<'EOF' || fail "a llama.cpp build resolves libraries outside its LD_LIBRARY_PATH (above)"
+import os, re, subprocess, sys
+from llmbench.suite.spec import SuiteSpec
+spec = SuiteSpec.from_yaml(sys.argv[1])
+bad, seen = [], set()
+for name in spec.deployment.backend:
+    b = spec.backends[name]
+    lib_path = b.env.get("LD_LIBRARY_PATH", "")
+    if b.type != "llamacpp" or (b.server_bin, lib_path) in seen:
+        continue
+    seen.add((b.server_bin, lib_path))
+    dirs = [d.rstrip("/") + "/" for d in lib_path.split(":") if d]
+    out = subprocess.run(["ldd", b.server_bin], capture_output=True, text=True,
+                         env={**os.environ, "LD_LIBRARY_PATH": lib_path}).stdout
+    libs = re.findall(r"(lib(?:ggml|llama|mtmd|zendnn)\S*) => (\S+)", out)
+    bad += [f"{name}: {lib} => {path}" for lib, path in libs
+            if not any(path.startswith(d) for d in dirs)]
+    print(f"{name}: {len(libs)} llama.cpp/ZenDNN libraries checked")
+print("\n".join(bad) or "every llama.cpp library resolves inside its build's LD_LIBRARY_PATH")
+sys.exit(1 if bad else 0)
+EOF
+
 # ---- 4. nothing of ours still running, and nobody else on the cores ------------------------
 for d in "$SMOKE_OUT" "$OUT"; do
   [ -d "$d" ] || continue

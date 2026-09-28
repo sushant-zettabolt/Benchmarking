@@ -124,8 +124,13 @@ before assuming these values still apply on a different pod.
    not the 5-10 the upstream doc claims). A second, independently-built copy already existed,
    world-readable, at `/proj/rdi/staff/sacsharm/llama.cpp/{build_release,build_zendnn}`, and
    was copied to `/proj/rdi/staff/sohroy/llama.cpp-sacsharm/{build,build_zendnn}` for
-   comparison -- both perform identically. sacsharm's copied binaries resolve some shared libs
-   via rpath back to `/proj/rdi/staff/sacsharm/...`; keep that tree in place if using the copy.
+   comparison -- both perform identically. sacsharm's copied binaries have a build-time RUNPATH
+   into his live trees (`/proj/rdi/staff/sacsharm/llama.cpp/{build_release,build_zendnn}/bin`,
+   `.../ZenDNN/build/install/zendnnl/lib`), so on their own they load *all* of libggml/libllama/
+   libzendnnl from there. The spec sets `LD_LIBRARY_PATH` per build to our copies (plus
+   `llama.cpp-sacsharm/zendnnl/lib/libzendnnl.so`, copied 2026-09-28, md5-identical), which
+   overrides RUNPATH; `scripts/run_turin_sweep.sh` step 3b fails if anything resolves outside.
+   vLLM still runs from sacsharm's venv (`/proj/rdi/staff/sacsharm/vllm/.venv`).
 2. **BF16 / Q8_0 GGUF and HF dir.** Found on **pod-7's local `/tmp/models/`** (container-local
    storage, not NFS-shared -- invisible from pod-5). Copied to shared storage at
    `/proj/rdi/staff/sohroy/models/`: `Llama-3.1-8B-Instruct-BF16.gguf`,

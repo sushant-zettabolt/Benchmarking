@@ -183,6 +183,12 @@ def test_the_turin_spec_in_the_repo_matches_the_reference_runs():
             assert b.extra_args == ["-fa", "on", "--load-mode", "mlock"]
             assert b.env["OMP_NUM_THREADS"] == "32" and "libomp.so.5" in b.env["LD_PRELOAD"]
             assert ("ZENDNNL_MATMUL_ALGO" in b.env) == ("zendnn" in name)
+            # The copied binaries' RUNPATH points into sacsharm's live build tree; each build
+            # must load its own libraries instead (see the comment on x-llamacpp-env).
+            lib_dirs = b.env["LD_LIBRARY_PATH"].split(":")
+            assert lib_dirs[0] == str(Path(b.server_bin).parent)
+            assert any("zendnnl" in d for d in lib_dirs) == ("zendnn" in name)
+            assert not any("/staff/sacsharm/" in d for d in lib_dirs)
         else:
             assert not b.deployment                                      # global 8192 applies
             assert b.env["VLLM_CPU_KVCACHE_SPACE"] == "90"
