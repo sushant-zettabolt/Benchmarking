@@ -33,6 +33,7 @@ from ..runner import CapacityError, run_instance
 from . import procs
 from .contention import ContentionMonitor
 from .deploy import CapacityFailure, DeploymentError, launch_deployment
+from .hostinfo import capture_host, capture_software
 from .lb import make_backend
 from .lb.fanout import FanoutBackend
 from .offline import run_offline
@@ -88,6 +89,9 @@ class TrialResult:
     started_at_utc: str = ""
     duration_s: float = 0.0
     provenance: dict[str, Any] = field(default_factory=dict)
+    # Every measured request of an online trial, one dict per rep (metrics.per_request_values),
+    # so a 3-rep trial keeps all three values and not only their mean. Client rows only.
+    reps: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -242,6 +246,8 @@ class SweepRunner:
         self.error_traceback: str | None = None
         self.stop_reason: str | None = None
         self.manifest: dict[str, Any] = {}
+        self.host: dict[str, Any] = {}
+        self.software: dict[str, Any] = {}
         self.deployment_records: list[dict[str, Any]] = []
         self._t0 = time.monotonic()
         self._closed = False
@@ -675,6 +681,12 @@ class SweepRunner:
             "warmup_iterations": raw[0].get("warmup_iterations") if raw else None,
             "backend_version": getattr(info, "version", None),
             "records_file": f"records/{dep.id}.jsonl",
+            # The exact command each server of this deployment was started with: argv (numactl
+            # prefix included) and the environment variables set on top of the sweep's own.
+            "server_commands": [
+                {"name": p.name, "argv": list(p.argv), "env": dict(p.env_overrides)}
+                for p in live.processes
+            ],
         }
         if isinstance(backend, FanoutBackend):
             provenance["lb_distribution"] = backend.distribution()
@@ -701,6 +713,7 @@ class SweepRunner:
                 warnings=warnings,
                 started_at_utc=started, duration_s=duration,
                 provenance=provenance,
+                reps=metrics.per_request_values(raw) if src == "client" else [],
             ))
 
     def _skip_group(self, dep, workloads, status: str, error: str) -> None:
@@ -796,6 +809,9 @@ class SweepRunner:
     async def run(self) -> list[TrialResult]:
         self.status = RUN_RUNNING
         self._write_json(self.out_dir / "plan.json", self.plan.to_dict())
+        self.host = capture_host()
+        # Skipped on a dry run: `vllm --version` alone can take tens of seconds.
+        self.software = {} if self.spec.dry_run else capture_software(self.spec.backends)
         self._write_manifest()
         self._event("run_start", {
             "pid": os.getpid(), "attempt": self.attempt, "plan_fingerprint": self.fingerprint,
@@ -872,6 +888,8 @@ class SweepRunner:
             "plan_fingerprint": self.fingerprint,
             "pid": os.getpid(),
             "host": socket.gethostname(),
+            "host_info": self.host,
+            "software": self.software,
             "first_started_at_utc": self.first_started_at,
             "started_at_utc": self.started_at,
             "ended_at_utc": _utc_now() if ended else None,
@@ -904,6 +922,7 @@ class SweepRunner:
                 "events": "events.jsonl",
                 "pids": procs.PIDS_FILE,
                 "raw_records": "records/",
+                "per_rep_values": "report_reps.csv",
                 "sqlite": "llmbench.db",
                 "logs": "logs/",
             },

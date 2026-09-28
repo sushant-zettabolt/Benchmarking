@@ -14,7 +14,7 @@ from ..execute import TrialResult, read_trials
 from ..objective import RankingReport, rank
 from ..spec import Constraint, ObjectiveSpec
 from .common import ReportContext
-from .csv import render_csv
+from .csv import render_csv, render_reps_csv
 from .html import render_html
 from .markdown import render_markdown
 
@@ -66,6 +66,8 @@ def reaggregate(out_dir: Path, results: list[TrialResult]) -> tuple[list[TrialRe
         if recomputed is None:
             continue
         row.metrics = result_row_to_metrics(recomputed)
+        if row.src == "client":
+            row.reps = metrics_mod.per_request_values(raw)
         updated += 1
     return results, updated
 
@@ -152,6 +154,11 @@ def write_reports(ctx: ReportContext, out_dir: str | Path,
         path = out_dir / f"report.{ext}"
         path.write_text(render(ctx, fmt))
         written[fmt] = path
+        if fmt == "csv":
+            # The per-rep companion to report.csv: one line per measured request.
+            reps_path = out_dir / "report_reps.csv"
+            reps_path.write_text(render_reps_csv(ctx))
+            written["reps_csv"] = reps_path
 
     best_path = out_dir / "best.json"
     best_path.write_text(json.dumps({

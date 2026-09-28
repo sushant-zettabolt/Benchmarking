@@ -205,13 +205,6 @@ async def run_instance(
     rng = random.Random(run_salt)
     request_counter = [0]
 
-    vllm_metrics_before = None
-    if backend.supports_vllm_metrics and params.measure in ("server", "both"):
-        try:
-            vllm_metrics_before = await backend.metrics_snapshot()
-        except Exception:  # noqa: BLE001 -- Path B is best-effort, never blocks the run
-            pass
-
     def next_prompt_tokens() -> list[int]:
         request_counter[0] += 1
         idx = request_counter[0]
@@ -275,6 +268,16 @@ async def run_instance(
         lambda: send_next(-1), no_warmup=params.no_warmup, warmup_fixed=params.warmup_fixed,
         on_iteration=_warmup_progress,
     )
+
+    # Taken after the warm-up, not before: vLLM's server-side numbers are a /metrics delta over
+    # the whole window, so a baseline from before the warm-up folded the (cold, slower) warm-up
+    # requests into every measured rep -- server t/s came out low and overhead_ms negative.
+    vllm_metrics_before = None
+    if backend.supports_vllm_metrics and params.measure in ("server", "both"):
+        try:
+            vllm_metrics_before = await backend.metrics_snapshot()
+        except Exception:  # noqa: BLE001 -- Path B is best-effort, never blocks the run
+            pass
 
     records: list[RawRecord] = []
     if instance.concurrency <= 1 and not params.request_rate:
@@ -367,6 +370,9 @@ def _attach_vllm_metrics_delta(rec: RawRecord, before: dict, after: dict) -> Non
     prompt_tok, gen_tok = delta("vllm:prompt_tokens_total"), delta("vllm:generation_tokens_total")
     cached_tok = delta("vllm:prompt_tokens_cached_total")
 
+    if prefill_cnt or decode_cnt:
+        # These are means over every request in the window, not this record's own timings.
+        rec.flags.append(metrics.SERVER_TIMINGS_TRIAL_MEAN)
     if prefill_cnt and prefill_cnt > 0 and prefill_sum is not None:
         rec.server_prompt_ms = (prefill_sum / prefill_cnt) * 1000.0
     if decode_cnt and decode_cnt > 0 and decode_sum is not None:

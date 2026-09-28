@@ -324,6 +324,54 @@ def aggregate_client(records: list[dict], test_name: str) -> ResultRow:
     return row
 
 
+# Record flag: this record's server_* timings are an average over the whole trial rather than
+# this request's own (set by runner._attach_vllm_metrics_delta).
+SERVER_TIMINGS_TRIAL_MEAN = "server_timings_trial_mean"
+
+
+def per_request_values(records: list[dict]) -> list[dict]:
+    """One dict per measured request (rep), in rep order: the same quantities the aggregate
+    rows report, before averaging, so every rep of a trial survives into the reports.
+
+    Each value is computed by the same helper the aggregate uses, applied to that one record,
+    so a rep's `tps` is exactly what `tps_mean` averages. Server-side values are included only
+    where they describe that one request: a record flagged SERVER_TIMINGS_TRIAL_MEAN carries a
+    whole-trial average (vLLM's /metrics delta, see runner._attach_vllm_metrics_delta), which
+    is not a per-rep number, so its server fields are left out here.
+    """
+    def one(fn, r):
+        vals = fn([r])
+        return vals[0] if vals else None
+
+    out = []
+    for r in sorted(records, key=lambda r: r.get("rep_idx", 0)):
+        client = _client_ts_samples([r])
+        itl = _itl_ms_values([r])
+        row = {
+            "rep": r.get("rep_idx"),
+            "error": r.get("error"),
+            "n_prompt": r.get("n_prompt_actual"),
+            "n_gen": r.get("n_gen_actual"),
+            "tps": client[0].ts if client else None,
+            "prefill_tps": one(_prefill_tps_values, r),
+            "decode_tps": one(_decode_tps_values, r),
+            "ttft_ms": one(_ttft_ms_values, r),
+            "e2e_ms": one(_e2e_ms_values, r),
+            "tpot_ms": one(_tpot_ms_values, r),
+            "itl_ms_mean": sum(itl) / len(itl) if itl else None,
+            "server_tps": None, "server_prefill_tps": None, "server_decode_tps": None,
+        }
+        if SERVER_TIMINGS_TRIAL_MEAN not in (r.get("flags") or []):
+            server = _server_ts_samples([r])
+            row["server_tps"] = server[0].ts if server else None
+            if not r.get("error") and r.get("server_prompt_n") and r.get("server_prompt_ms"):
+                row["server_prefill_tps"] = 1e3 * r["server_prompt_n"] / r["server_prompt_ms"]
+            if not r.get("error") and r.get("server_predicted_n") and r.get("server_predicted_ms"):
+                row["server_decode_tps"] = 1e3 * r["server_predicted_n"] / r["server_predicted_ms"]
+        out.append(row)
+    return out
+
+
 def aggregate_server(records: list[dict], test_name: str) -> ResultRow | None:
     """Returns None if no server-side timing data is present at all (src=server -> N/A,
     never faked -- spec §3)."""

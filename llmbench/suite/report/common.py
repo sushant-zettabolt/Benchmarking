@@ -6,6 +6,7 @@ latency column would read as an extraordinary result rather than as missing data
 """
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -33,6 +34,10 @@ COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rate", "axis", "request_rate"),
     ("t/s", "metric", "tps_mean"),
     ("t/s sd", "metric", "tps_stddev"),
+    # t/s is (prompt + generated tokens) / end-to-end time. These two split it the way
+    # llama-batched-bench's S_PP / S_TG do: prompt tokens / TTFT, and (n_gen - 1) / decode time.
+    ("prefill t/s", "metric", "prefill_tps_mean"),
+    ("decode t/s", "metric", "decode_tps_mean"),
     ("tok tput", "metric", "total_token_throughput"),
     ("req tput", "metric", "request_throughput"),
     ("ttft p50", "metric", "ttft_ms_p50"),
@@ -100,6 +105,93 @@ def rows_for(results: list[TrialResult], columns: list[tuple[str, str, str]]) ->
     return [[fmt(cell(r, s, k)) for _, s, k in columns] for r in results]
 
 
+# report_reps.csv: one line per measured request. (header, key in metrics.per_request_values)
+REP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("rep", "rep"),
+    ("n_prompt", "n_prompt"),
+    ("n_gen", "n_gen"),
+    ("t/s", "tps"),
+    ("prefill t/s", "prefill_tps"),
+    ("decode t/s", "decode_tps"),
+    ("ttft ms", "ttft_ms"),
+    ("e2e ms", "e2e_ms"),
+    ("tpot ms", "tpot_ms"),
+    ("itl mean ms", "itl_ms_mean"),
+    ("server t/s", "server_tps"),
+    ("server prefill t/s", "server_prefill_tps"),
+    ("server decode t/s", "server_decode_tps"),
+    ("error", "error"),
+)
+
+
+def shell_command(cmd: dict[str, Any]) -> str:
+    """One server's launch as a copy-pasteable shell line: `K=V ... numactl ... server ...`.
+    The env part is what the sweep set on top of its own environment, not the whole env."""
+    env = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in (cmd.get("env") or {}).items())
+    argv = shlex.join(str(a) for a in cmd.get("argv") or [])
+    return f"{env} {argv}".strip()
+
+
+def server_commands(results: Iterable[TrialResult]) -> dict[str, tuple[str, list[dict]]]:
+    """deployment id -> (backend, the commands its servers were started with), in run order,
+    read back from each row's provenance so a re-rendered report still has them."""
+    out: dict[str, tuple[str, list[dict]]] = {}
+    for r in results:
+        cmds = (r.provenance or {}).get("server_commands")
+        if cmds and r.deployment_id not in out:
+            out[r.deployment_id] = (r.backend, cmds)
+    return out
+
+
+def host_lines(manifest: dict[str, Any]) -> list[tuple[str, str]]:
+    """(label, value) pairs describing the host/pod and the server software, for md/html."""
+    h = manifest.get("host_info") or {}
+    if not h:
+        return []
+    k8s = h.get("kubernetes") or {}
+    lines = [("host", h.get("hostname", ""))]
+    if k8s.get("in_pod"):
+        pod = k8s.get("pod") or h.get("hostname", "")
+        lines.append(("kubernetes pod", f"{pod} (namespace {k8s.get('namespace') or '?'}"
+                                        f"{', node ' + k8s['node'] if k8s.get('node') else ''})"))
+    lines += [
+        ("os / kernel", f"{h.get('os', '')} / {h.get('kernel', '')}"),
+        ("cpu", h.get("cpu_model", "")),
+        ("cpus online / allowed", f"{h.get('cpus_online', '')} / {h.get('cpus_allowed', '')}"),
+        ("numa mems allowed", h.get("mems_allowed", "")),
+        ("memory", f"{h.get('mem_total_gib')} GiB total"),
+    ]
+    allowed = {str(n) for n in _expand(h.get("mems_allowed", ""))}
+    for n in h.get("numa_nodes") or []:
+        if not allowed or str(n.get("node")) in allowed:
+            lines.append((f"numa node {n.get('node')}",
+                          f"cpus {n.get('cpus')}, {n.get('mem_total_gib')} GiB total, "
+                          f"{n.get('mem_free_gib')} GiB free at start"))
+    cg = h.get("cgroup") or {}
+    lines += [
+        ("cgroup cpu.max / memory.max", f"{cg.get('cpu_max') or '-'} / {cg.get('memory_max') or '-'}"),
+        ("memlock limit", h.get("memlock_limit", "")),
+        ("python / llmbench", f"{h.get('python', '')} / {h.get('llmbench_commit') or '?'}"),
+    ]
+    for path, sw in (manifest.get("software") or {}).items():
+        pkgs = ", ".join(f"{k} {v}" for k, v in (sw.get("packages") or {}).items())
+        lines.append((f"{sw.get('type')} {path}",
+                      sw.get("version", "") + (f" [{pkgs}]" if pkgs else "")))
+    return lines
+
+
+def _expand(cpulist: str) -> list[int]:
+    """'0-2,5' -> [0, 1, 2, 5]; tolerant of empty or malformed input."""
+    out: list[int] = []
+    for part in (cpulist or "").split(","):
+        lo, _, hi = part.strip().partition("-")
+        try:
+            out.extend(range(int(lo), int(hi or lo) + 1))
+        except ValueError:
+            continue
+    return out
+
+
 @dataclass
 class ReportContext:
     """Everything the renderers need, assembled once."""
@@ -141,4 +233,5 @@ class ReportContext:
         return list(seen)
 
 
-__all__ = ["COLUMNS", "LOWER_IS_BETTER", "ReportContext", "cell", "fmt", "used_columns", "rows_for"]
+__all__ = ["COLUMNS", "LOWER_IS_BETTER", "REP_COLUMNS", "ReportContext", "cell", "fmt",
+           "host_lines", "rows_for", "server_commands", "shell_command", "used_columns"]

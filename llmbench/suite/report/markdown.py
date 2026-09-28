@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 
-from .common import ReportContext, rows_for, used_columns
+from .common import (ReportContext, host_lines, rows_for, server_commands, shell_command,
+                     used_columns)
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -145,6 +146,24 @@ def render_markdown(ctx: ReportContext) -> str:
         for w in warnings:
             a(f"- {w}")
         a("")
+
+    # ---- provenance ----
+    host = host_lines(m)
+    if host:
+        a("## Host and software\n")
+        a(_table(["", "value"], [[k, str(v)] for k, v in host]))
+
+    commands = server_commands(ctx.results)
+    if commands:
+        a("## Server commands\n")
+        a("Exactly as launched. The variables in front are the ones the sweep set on top of "
+          "its own environment.\n")
+        for dep_id, (backend, cmds) in commands.items():
+            a(f"**{dep_id} — {backend}**\n")
+            a("```bash")
+            for c in cmds:
+                a(shell_command(c))
+            a("```\n")
 
     a("## Artifacts\n")
     for label, path in (m.get("artifacts") or {}).items():

@@ -17,9 +17,12 @@ import html
 import json
 from typing import Any
 
-from .common import LOWER_IS_BETTER, ReportContext, cell, fmt, rows_for, used_columns
+from .common import (LOWER_IS_BETTER, ReportContext, cell, fmt, host_lines, rows_for,
+                     server_commands, shell_command, used_columns)
 
 CSS = """
+pre{white-space:pre-wrap;word-break:break-all;background:var(--chip);border:1px solid var(--line);
+padding:.55rem .75rem;border-radius:8px;font:12px/1.5 ui-monospace,Menlo,monospace}
 :root{--bg:#fbfbfa;--fg:#1a1a19;--muted:#6b6b68;--line:#e3e3e0;--card:#fff;
 --accent:#2f6f4e;--warn:#8a5a00;--bad:#a33;--good:#2f6f4e;--chip:#f0f0ed;--bar:#5b8c72;}
 @media (prefers-color-scheme:dark){:root{--bg:#16171a;--fg:#e8e8e6;--muted:#9a9a96;
@@ -379,6 +382,22 @@ def render_html(ctx: ReportContext) -> str:
         for w in warnings:
             a(f"<li>{_e(w)}</li>")
         a("</ul>")
+
+    # ---- provenance ----
+    host = host_lines(m)
+    if host:
+        a("<h2>Host and software</h2>")
+        a(_table_html(["", "value"], [[k, str(v)] for k, v in host],
+                      table_id="host", numeric_cols=set(), sortable=False))
+
+    commands = server_commands(ctx.results)
+    if commands:
+        a("<h2>Server commands</h2>")
+        a('<p class="note">Exactly as launched. The variables in front are the ones the sweep '
+          "set on top of its own environment.</p>")
+        for dep_id, (backend, cmds) in commands.items():
+            a(f"<h3>{_e(dep_id)} — {_e(backend)}</h3>")
+            a("<pre>" + _e("\n".join(shell_command(c) for c in cmds)) + "</pre>")
 
     # ---- artifacts ----
     a("<h2>Artifacts</h2><ul class='warn'>")

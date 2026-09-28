@@ -223,7 +223,7 @@ def test_missing_metrics_render_blank_never_zero(ctx):
 
 def test_write_reports_emits_every_artifact(ctx, tmp_path):
     written = write_reports(ctx, tmp_path)
-    assert set(written) == {"html", "md", "csv", "json", "best"}
+    assert set(written) == {"html", "md", "csv", "reps_csv", "json", "best"}
     for path in written.values():
         assert path.exists() and path.stat().st_size > 0
     best = json.loads((tmp_path / "best.json").read_text())
