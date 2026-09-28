@@ -64,7 +64,14 @@ class VllmBackend(Backend):
     def __init__(self, base_url: str, api_key: str | None = None, timeout_s: float = 300.0):
         super().__init__(base_url, api_key, timeout_s)
         timeout = httpx.Timeout(connect=10.0, read=timeout_s, write=30.0, pool=10.0)
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+        # No keep-alive pooling. llama-server (cpp-httplib) closes a kept-alive connection after a
+        # few requests, and reusing one it has just closed fails the next request instantly with
+        # "Server disconnected without sending a response" -- before it ever reaches the server
+        # (seen in the Turin smoke run, ~1 request in 8). A fresh localhost connection per request
+        # costs ~0.1 ms, the same for every backend, and makes that race impossible rather than
+        # retried: a retry would be timed as one slow request.
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout,
+                                         limits=httpx.Limits(max_keepalive_connections=0))
         self._token_id_prompts_supported: bool | None = None
         self._tokenizer_model: str | None = None
 
@@ -171,8 +178,13 @@ class VllmBackend(Backend):
     ) -> AsyncIterator[StreamChunk]:
         self._tokenizer_model = model
         prompt: Any = token_ids if token_ids is not None else text
+        # skip_special_tokens=False: vLLM otherwise drops special tokens from the streamed text,
+        # so a generated special token arrives as an empty chunk and TTFT (first *non-empty*
+        # chunk) goes unmeasured -- a pp test's only token, sampled from a random prompt, is
+        # sometimes one (seen with Qwen3.6 W8A8). Detokenization only; compute is unchanged.
         payload = build_completions_payload(
-            model=model, prompt=prompt, max_tokens=max_tokens, ignore_eos=ignore_eos, extra=extra,
+            model=model, prompt=prompt, max_tokens=max_tokens, ignore_eos=ignore_eos,
+            extra={"skip_special_tokens": False, **(extra or {})},
         )
         parser = SSEParser()
         async with self._client.stream(

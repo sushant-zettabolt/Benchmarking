@@ -366,7 +366,8 @@ def per_request_values(records: list[dict]) -> list[dict]:
             row["server_tps"] = server[0].ts if server else None
             if not r.get("error") and r.get("server_prompt_n") and r.get("server_prompt_ms"):
                 row["server_prefill_tps"] = 1e3 * r["server_prompt_n"] / r["server_prompt_ms"]
-            if not r.get("error") and r.get("server_predicted_n") and r.get("server_predicted_ms"):
+            if (not r.get("error") and (r.get("server_predicted_n") or 0) > 1
+                    and r.get("server_predicted_ms")):
                 row["server_decode_tps"] = 1e3 * r["server_predicted_n"] / r["server_predicted_ms"]
         out.append(row)
     return out
@@ -391,9 +392,12 @@ def aggregate_server(records: list[dict], test_name: str) -> ResultRow | None:
             [1e9 * r["server_prompt_n"] / (r["server_prompt_ms"] * 1e6) for r in records
              if not r.get("error") and r.get("server_prompt_n") and r.get("server_prompt_ms")]
         ),
+        # A decode rate needs >= 2 generated tokens, as on the client side: for a single token
+        # llama-server reports predicted_ms = 0.001, which read as 1,000,000 t/s.
         decode_tps=Stats.from_values(
             [1e9 * r["server_predicted_n"] / (r["server_predicted_ms"] * 1e6) for r in records
-             if not r.get("error") and r.get("server_predicted_n") and r.get("server_predicted_ms")]
+             if not r.get("error") and (r.get("server_predicted_n") or 0) > 1
+             and r.get("server_predicted_ms")]
         ),
     )
 
