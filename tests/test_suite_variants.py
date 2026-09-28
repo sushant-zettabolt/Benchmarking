@@ -165,27 +165,37 @@ def test_the_turin_spec_in_the_repo_matches_the_reference_runs():
 
     path = Path(__file__).resolve().parent.parent / "sweep.turin-32c-8b.yaml"
     spec = SuiteSpec.from_yaml(path)
-    assert set(spec.deployment.backend) == {
-        "llamacpp-zendnn-bf16", "llamacpp-zendnn-q8", "llamacpp-bf16", "llamacpp-q8",
-        "vllm-bf16", "vllm-w8a8",
-    }
-    assert spec.cpu.budget == "192-223" and spec.cpu.membind == "6"
+    variants = ["llamacpp-zendnn-bf16", "llamacpp-zendnn-q8", "llamacpp-bf16", "llamacpp-q8",
+                "vllm-bf16", "vllm-w8a8"]
+    assert set(spec.deployment.backend) == {f"{m}-{v}" for m in ("llama31", "qwen36")
+                                            for v in variants}
+    assert spec.cpu.budget == "160-191" and spec.cpu.membind == "5"       # pod-5's cpuset
     assert spec.deployment.instances == [1] and spec.deployment.n_parallel == [1]
     assert spec.workload.reps == 3 and spec.workload.warmup_fixed == 1
-    assert spec.workload.n_prompt == [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 512, 1024,
-                                      2048, 3072, 4096]
+    assert spec.workload.n_prompt == [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 384, 512, 768,
+                                      1024, 1536, 2048, 3072, 4096]      # -npp
     assert spec.workload.n_gen == [128]
-    assert len({b.base_port for b in spec.backends.values()}) == 6
+    assert len({b.base_port for b in spec.backends.values()}) == 12
 
     for name, b in spec.backends.items():
         if b.type == "llamacpp":
             assert b.deployment == {"n_ctx": [32000]}                    # -c 32000
-            assert b.extra_args[:2] == ["-fa", "on"]
+            assert b.extra_args == ["-fa", "on", "--load-mode", "mlock"]
             assert b.env["OMP_NUM_THREADS"] == "32" and "libomp.so.5" in b.env["LD_PRELOAD"]
             assert ("ZENDNNL_MATMUL_ALGO" in b.env) == ("zendnn" in name)
         else:
             assert not b.deployment                                      # global 8192 applies
             assert b.env["VLLM_CPU_KVCACHE_SPACE"] == "90"
             assert "--enforce-eager" in b.extra_args
+            # Qwen3.6's HF checkpoints are multimodal; only its variants skip the vision tower.
+            assert ("--language-model-only" in b.extra_args) == name.startswith("qwen36-")
+
+    # Both models get the same engine settings: each qwen36 variant matches its llama31 twin
+    # in everything but the weights, the served name, the port and --language-model-only.
+    for v in variants:
+        llama, qwen = spec.backends[f"llama31-{v}"], spec.backends[f"qwen36-{v}"]
+        assert (qwen.type, qwen.server_bin, qwen.env, qwen.deployment) == \
+               (llama.type, llama.server_bin, llama.env, llama.deployment)
+        assert [a for a in qwen.extra_args if a != "--language-model-only"] == llama.extra_args
     assert spec.deployment.n_ctx == [8192]                               # --max-model-len
     assert spec.deployment.batch == [4096] and spec.deployment.ubatch == [4096]

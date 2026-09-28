@@ -1,3 +1,4 @@
+# vLLM-only copy of sweep.turin-smoke.yaml: checks the Llama vLLM variants start and serve.
 # Llama 3.1 8B and Qwen3.6-35B-A3B on 32 Turin cores (160-191, NUMA node 5): ZenDNN llama.cpp vs
 # stock llama.cpp vs vLLM, each at 16-bit weights (BF16) and 8-bit weights (Q8_0 for llama.cpp,
 # W8A8 for vLLM). Both models get identical engine settings; only weights, names and ports differ,
@@ -73,8 +74,8 @@
 # If it dies, continue where it stopped:
 #   llmbench sweep run --spec sweep.turin-32c-8b.yaml --resume
 
-name: turin-32c-llama31-qwen36
-out_dir: out/turin-32c-llama31-qwen36
+name: turin-vllm-check
+out_dir: out/turin-vllm-check
 mode: online
 
 # ---------------------------------------------------------------- CPU placement
@@ -242,10 +243,7 @@ backends:
 
 # ---------------------------------------------------------------- sweep axes
 deployment:
-  backend: [llama31-llamacpp-zendnn-bf16, llama31-llamacpp-zendnn-q8, llama31-llamacpp-bf16,
-            llama31-llamacpp-q8, llama31-vllm-bf16, llama31-vllm-w8a8,
-            qwen36-llamacpp-zendnn-bf16, qwen36-llamacpp-zendnn-q8, qwen36-llamacpp-bf16,
-            qwen36-llamacpp-q8, qwen36-vllm-bf16, qwen36-vllm-w8a8]
+  backend: [llama31-vllm-bf16, llama31-vllm-w8a8]
   instances: [1]
   n_parallel: [1]        # one slot / --max-num-seqs 1: the reference's batch size 1
   n_ctx: [8192]          # vLLM --max-model-len 8192
@@ -253,10 +251,10 @@ deployment:
   ubatch: [4096]         # llama.cpp -ub 4096 (vLLM has no equivalent)
 
 workload:
-  n_prompt: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
-  n_gen: [128]
+  n_prompt: [16]
+  n_gen: [16]
   concurrency: [1]
-  reps: 3                # --num-iters 3
+  reps: 3
   warmup_fixed: 1        # --num-iters-warmup 1
 
 # ---------------------------------------------------------------- what "best" means
