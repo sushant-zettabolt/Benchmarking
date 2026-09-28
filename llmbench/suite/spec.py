@@ -480,6 +480,10 @@ class SuiteSpec:
     request_timeout_s: float = 600.0
     settle_s: float = 3.0             # pause after teardown before the next launch
     continue_on_error: bool = True
+    # Per-core CPU utilisation of each deployment's cores is sampled this often while its
+    # servers are up and written to cores/<deployment>.csv. 0 turns the sampler off. Not part
+    # of the plan fingerprint: it observes the run, it does not change what is measured.
+    core_sample_interval_s: float = 0.25
     endpoint: str = "completions"
     dry_run: bool = False
 
@@ -487,7 +491,8 @@ class SuiteSpec:
     def from_dict(cls, data: dict[str, Any]) -> "SuiteSpec":
         known = ("name", "out_dir", "mode", "cpu", "lb", "backends", "deployment", "workload",
                  "offline", "objective", "constraints", "startup_timeout_s",
-                 "request_timeout_s", "settle_s", "continue_on_error", "endpoint", "dry_run")
+                 "request_timeout_s", "settle_s", "continue_on_error", "core_sample_interval_s",
+                 "endpoint", "dry_run")
         # Top-level `x-*` keys are ignored, as in docker-compose: they exist to hold YAML
         # anchors (`x-llamacpp-env: &env {...}`) shared by several backends. Only the prefix
         # is exempt, so a misspelt real key still fails.
@@ -513,6 +518,7 @@ class SuiteSpec:
             request_timeout_s=float(data.get("request_timeout_s", 600.0)),
             settle_s=float(data.get("settle_s", 3.0)),
             continue_on_error=bool(data.get("continue_on_error", True)),
+            core_sample_interval_s=float(data.get("core_sample_interval_s", 0.25)),
             endpoint=_one_of(data.get("endpoint"), "endpoint", ("completions", "chat"), "completions"),
             dry_run=bool(data.get("dry_run", False)),
         )
@@ -544,6 +550,9 @@ class SuiteSpec:
                 raise SpecError(f"backends.{name}.server_bin is required for mode={self.mode}")
         if self.workload.reps < 1:
             raise SpecError("workload.reps must be >= 1")
+        if self.core_sample_interval_s != 0 and self.core_sample_interval_s < 0.05:
+            # /proc/stat counts in 10 ms ticks: below ~50 ms a sample is mostly rounding.
+            raise SpecError("core_sample_interval_s must be 0 (off) or >= 0.05")
         if self.offline.reps < 1:
             raise SpecError("offline.reps must be >= 1")
         if any(c < 1 for c in self.workload.concurrency):

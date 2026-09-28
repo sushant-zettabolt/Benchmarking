@@ -17,6 +17,7 @@ import dataclasses
 import datetime
 import json
 import os
+import re
 import socket
 import time
 import traceback
@@ -32,6 +33,7 @@ from ..records import JsonlSink, SqliteSink
 from ..runner import CapacityError, run_instance
 from . import procs
 from .contention import ContentionMonitor
+from .coresampler import CoreSampler
 from .deploy import CapacityFailure, DeploymentError, launch_deployment
 from .hostinfo import capture_host, capture_software
 from .lb import make_backend
@@ -61,6 +63,9 @@ RUN_FAILED = "failed"
 # contaminated. 15% is roughly where a measurement stops being reproducible on this class of
 # machine; below it, normal system noise dominates.
 CONTENTION_WARN_PCT = 15.0
+
+# cores/<deployment>.csv, or cores/<deployment>.a<attempt>.csv after a resume.
+_LIVE_CORES_FILE = re.compile(r"d\d+(\.a\d+)?")
 
 
 class ResumeError(RuntimeError):
@@ -249,12 +254,14 @@ class SweepRunner:
         self.host: dict[str, Any] = {}
         self.software: dict[str, Any] = {}
         self.deployment_records: list[dict[str, Any]] = []
+        self._sampler: CoreSampler | None = None
         self._t0 = time.monotonic()
         self._closed = False
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         (self.out_dir / "records").mkdir(exist_ok=True)
         (self.out_dir / "logs").mkdir(exist_ok=True)
+        (self.out_dir / "cores").mkdir(exist_ok=True)
         self._refuse_if_previous_run_is_alive()
 
         self._trials_path = self.out_dir / "trials.jsonl"
@@ -333,6 +340,12 @@ class SweepRunner:
             if not (path.exists() and path.stat().st_size):
                 continue
             moved.append(self._archive(path, suffix).name)
+        for path in sorted((self.out_dir / "cores").glob("*.csv")):
+            # Live files only (d000.csv, d000.a2.csv); an earlier archive stays as it is.
+            if not _LIVE_CORES_FILE.fullmatch(path.stem):
+                continue
+            if path.stat().st_size:
+                moved.append(f"cores/{self._archive(path, suffix).name}")
         if moved:
             self._event("warning", {
                 "deployment": "",
@@ -543,6 +556,14 @@ class SweepRunner:
                                f"placement unverified (see deployments.json)",
                 })
 
+            if self.spec.core_sample_interval_s > 0:
+                self._sampler = CoreSampler(
+                    cpus=[c for i in dep.instances for c in i.cores.cpus],
+                    pids=[p.pid for p in live.processes],
+                    path=self._cores_path(dep), interval_s=self.spec.core_sample_interval_s,
+                )
+                self._sampler.start()
+
             backend = make_backend(dep, self.spec)
             jsonl_sink = JsonlSink(self.out_dir / "records" / f"{dep.id}.jsonl")
             sink = _MultiSink(jsonl_sink, self._sqlite)
@@ -563,6 +584,13 @@ class SweepRunner:
             for w in workloads:
                 await self._run_workload(dep, w, backend, sink, info, live)
         finally:
+            if self._sampler is not None:
+                try:
+                    self._sampler.stop()
+                except Exception as e:  # noqa: BLE001 -- an observer must not block teardown
+                    self._event("warning", {"deployment": dep.id,
+                                            "message": f"core sampler: {type(e).__name__}: {e}"})
+                self._sampler = None
             if jsonl_sink is not None:
                 jsonl_sink.close()
             if backend is not None:
@@ -573,6 +601,12 @@ class SweepRunner:
             for message in await live.teardown(settle_s=self.spec.settle_s):
                 self._event("warning", {"deployment": dep.id, "message": message})
             self._event("deployment_end", {"deployment_id": dep.id})
+
+    def _cores_path(self, dep: DeploymentPlan) -> Path:
+        """cores/<deployment>.csv, or cores/<deployment>.a<N>.csv from a resumed attempt, so a
+        redone deployment does not append to the time series of the attempt it replaces."""
+        name = dep.id if self.attempt == 1 else f"{dep.id}.a{self.attempt}"
+        return self.out_dir / "cores" / f"{name}.csv"
 
     def _trial_run_id(self, dep: DeploymentPlan, w: WorkloadPlan) -> str:
         """The run_id written into every raw record of one trial.
@@ -606,7 +640,10 @@ class SweepRunner:
             pids=[p.pid for p in live.processes],
         )
         monitor.start()
+        if self._sampler is not None:
+            self._sampler.begin_trial(trial_id, w.test_name())
 
+        records = []
         try:
             records = await run_instance(
                 backend, inst, params, run_id=run_id, sink=sink, run_salt=new_run_salt(),
@@ -631,6 +668,10 @@ class SweepRunner:
             if not self.spec.continue_on_error:
                 raise
             return
+        finally:
+            if self._sampler is not None:
+                self._sampler.end_trial([(r.rep_idx, r.t_send_ns, r.t_end_ns) for r in records
+                                         if r.t_send_ns and r.t_end_ns])
 
         raw = [r.to_dict() for r in records]
         duration = time.monotonic() - t0
@@ -681,6 +722,8 @@ class SweepRunner:
             "warmup_iterations": raw[0].get("warmup_iterations") if raw else None,
             "backend_version": getattr(info, "version", None),
             "records_file": f"records/{dep.id}.jsonl",
+            "core_timeseries": (str(self._sampler.path.relative_to(self.out_dir))
+                                if self._sampler is not None else None),
             # The exact command each server of this deployment was started with: argv (numactl
             # prefix included) and the environment variables set on top of the sweep's own.
             "server_commands": [
@@ -923,6 +966,7 @@ class SweepRunner:
                 "pids": procs.PIDS_FILE,
                 "raw_records": "records/",
                 "per_rep_values": "report_reps.csv",
+                "core_timeseries": "cores/",
                 "sqlite": "llmbench.db",
                 "logs": "logs/",
             },
