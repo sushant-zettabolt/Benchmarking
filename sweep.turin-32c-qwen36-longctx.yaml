@@ -1,0 +1,148 @@
+# Qwen3.6-35B-A3B long-prompt prefill on 32 Turin cores (160-191, NUMA node 5): the six qwen36-*
+# variants of sweep.turin-32c-8b.yaml, extended past that sweep's pp4096 ceiling.
+#
+# Everything (binaries, weights, env, server flags, CPU placement) is copied unchanged from
+# sweep.turin-32c-8b.yaml -- see its header for the reference settings and weight provenance.
+# Differences from that spec:
+#  - Only the six Qwen variants.
+#  - Prompts: the main sweep's pp1..pp4096 list, then 5120, 6144, 7168, 8192, 10240, 12288.
+#  - Prefill only (n_gen: [0]): no tg test. The main sweep's tg128 is prompt-free, so it would
+#    just repeat that sweep's number.
+#  - vLLM --max-model-len 16384 (was 8192): 8192 cannot hold a 10240/12288-token prompt. The
+#    max-model-len does not size vLLM's KV cache (VLLM_CPU_KVCACHE_SPACE does), and chunked
+#    prefill at --max-num-batched-tokens 4096 is unchanged, so prompts > 4096 are prefilled in
+#    4096-token chunks, as llama.cpp does with -b/-ub 4096. llama.cpp keeps -c 32000.
+# 6 variants x 24 tests = 144 trials, 3 reps + 1 warm-up each.
+
+name: turin-32c-qwen36-longctx
+out_dir: out/turin-32c-qwen36-longctx
+mode: online
+
+# ---------------------------------------------------------------- CPU placement
+cpu:
+  budget: "160-191"
+  smt: exclude
+  ccd_align: true
+  membind: "5"
+  numa_policy: membind
+
+lb:
+  kind: client
+
+# ---------------------------------------------------------------- installations
+x-llamacpp-env: &llamacpp_env
+  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/proj/rdi/staff/sohroy/lib/libomp.so.5
+  LD_LIBRARY_PATH: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build/bin
+  KMP_AFFINITY: granularity=fine,compact,1,0
+  OMP_NUM_THREADS: "32"
+
+x-llamacpp-zendnn-env: &llamacpp_zendnn_env
+  <<: *llamacpp_env
+  LD_LIBRARY_PATH: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build_zendnn/bin:/proj/rdi/staff/sohroy/llama.cpp-sacsharm/zendnnl/lib
+  ZENDNNL_MATMUL_ALGO: "1"
+
+x-llamacpp-deployment: &llamacpp_deployment
+  n_ctx: 32000           # -c 32000
+
+x-llamacpp-args: &llamacpp_args ["-fa", "on", "--load-mode", "mlock"]
+
+x-vllm-env: &vllm_env
+  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/proj/rdi/staff/sacsharm/vllm/.venv/lib/libiomp5.so
+  OMP_NUM_THREADS: "32"
+  VLLM_CPU_KVCACHE_SPACE: "90"
+  ZENDNNL_MATMUL_ALGO: "1"
+  ZENDNNL_MATMUL_WEIGHT_CACHE: "1"
+  ZENDNNL_LRU_CACHE_CAPACITY: "1024"
+
+x-vllm-qwen-args: &vllm_qwen_args
+  ["--dtype", "auto", "--kv-cache-dtype", "auto", "--enforce-eager",
+   "--distributed-executor-backend", "mp", "--language-model-only"]
+
+backends:
+  qwen36-llamacpp-zendnn-bf16:
+    type: llamacpp
+    model: /proj/rdi/staff/sacsharm/models/gguf/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build_zendnn/bin/llama-server
+    base_port: 8300
+    extra_args: *llamacpp_args
+    env: *llamacpp_zendnn_env
+    deployment: *llamacpp_deployment
+
+  qwen36-llamacpp-zendnn-q8:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-Q8_0.gguf
+    served_model_name: qwen3.6-35b-a3b-q8_0
+    server_bin: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build_zendnn/bin/llama-server
+    base_port: 8310
+    extra_args: *llamacpp_args
+    env: *llamacpp_zendnn_env
+    deployment: *llamacpp_deployment
+
+  qwen36-llamacpp-bf16:
+    type: llamacpp
+    model: /proj/rdi/staff/sacsharm/models/gguf/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build/bin/llama-server
+    base_port: 8320
+    extra_args: *llamacpp_args
+    env: *llamacpp_env
+    deployment: *llamacpp_deployment
+
+  qwen36-llamacpp-q8:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-Q8_0.gguf
+    served_model_name: qwen3.6-35b-a3b-q8_0
+    server_bin: /proj/rdi/staff/sohroy/llama.cpp-sacsharm/build/bin/llama-server
+    base_port: 8330
+    extra_args: *llamacpp_args
+    env: *llamacpp_env
+    deployment: *llamacpp_deployment
+
+  qwen36-vllm-bf16:
+    type: vllm
+    model: /proj/rdi/staff/sacsharm/models/hf/Qwen3.6-35B-A3B
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/rdi/staff/sacsharm/vllm/.venv/bin/vllm
+    base_port: 8400
+    extra_args: *vllm_qwen_args
+    env: *vllm_env
+
+  qwen36-vllm-w8a8:
+    type: vllm
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-w8a8-llmcompressor
+    served_model_name: qwen3.6-35b-a3b-w8a8
+    server_bin: /proj/rdi/staff/sacsharm/vllm/.venv/bin/vllm
+    base_port: 8410
+    extra_args: *vllm_qwen_args
+    env: *vllm_env
+
+# ---------------------------------------------------------------- sweep axes
+deployment:
+  backend: [qwen36-llamacpp-zendnn-bf16, qwen36-llamacpp-zendnn-q8, qwen36-llamacpp-bf16,
+            qwen36-llamacpp-q8, qwen36-vllm-bf16, qwen36-vllm-w8a8]
+  instances: [1]
+  n_parallel: [1]
+  n_ctx: [16384]         # vLLM --max-model-len 16384 (main sweep: 8192); llama.cpp overrides to 32000
+  batch: [4096]
+  ubatch: [4096]
+
+workload:
+  n_prompt: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+             5120, 6144, 7168, 8192, 10240, 12288]
+  n_gen: [0]             # prefill only
+  concurrency: [1]
+  reps: 3
+  warmup_fixed: 1
+
+# ---------------------------------------------------------------- what "best" means
+objective:
+  metric: tps_mean
+  goal: max
+  src: client
+
+startup_timeout_s: 3600
+request_timeout_s: 900   # main sweep's slowest Qwen pp4096 was ~16 s
+settle_s: 10
+continue_on_error: true
+core_sample_interval_s: 0.25
