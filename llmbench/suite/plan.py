@@ -262,9 +262,15 @@ def _cartesian(axes: list[list]) -> Iterator[tuple]:
             yield (h,) + t
 
 
-def _expand_workloads(spec: SuiteSpec) -> list[WorkloadPlan]:
-    """Mirrors get_cmd_params_instances(): pp / tg / pg are parallel inner loops, not nested."""
+def _expand_workloads(spec: SuiteSpec, backend: str | None = None) -> list[WorkloadPlan]:
+    """Mirrors get_cmd_params_instances(): pp / tg / pg are parallel inner loops, not nested.
+
+    With `backend`, that backend's own `workload:` values (n_prompt / n_gen) replace the global
+    ones, as its `deployment:` values do for the server axes.
+    """
     w = spec.workload
+    if backend is not None and spec.backends[backend].workload:
+        w = dataclasses.replace(w, **spec.backends[backend].workload)
     rates: list[float | None] = list(w.request_rate) if w.request_rate else [None]
     out: list[WorkloadPlan] = []
     idx = 0
@@ -320,13 +326,12 @@ def build_plan(spec: SuiteSpec, topo: Topology | None = None) -> SweepPlan:
 
     cores_axis: list[int | None] = list(d.cores_per_instance) or [None]
 
-    workloads = _expand_workloads(spec) if spec.mode in ("online", "both") else []
-
     if spec.mode in ("online", "both"):
         dep_idx = 0
         for backend, n_inst, cpi, n_ctx, n_par, batch, ubatch, threads in _deployment_points(
             spec, cores_axis,
         ):
+            workloads = _expand_workloads(spec, backend)
             try:
                 alloc = allocate(
                     topo, spec.cpu.budget, n_instances=n_inst, smt=spec.cpu.smt,

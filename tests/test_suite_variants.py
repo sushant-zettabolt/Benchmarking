@@ -152,6 +152,35 @@ def test_only_server_axes_can_be_overridden_per_backend():
                                 "deployment": {"instances": [2]}}})
 
 
+def test_a_backend_s_own_prompt_list_replaces_the_global_one_for_that_backend_only():
+    """A long-context model gets prompts the others cannot hold, in the same run and table."""
+    backends = {
+        "llamacpp": {"model": "/m/x.gguf", "server_bin": "/b/llama-server"},
+        "vllm": {"model": "/m/hf", "server_bin": "/v/vllm",
+                 "workload": {"n_prompt": [64, 8192]}},
+    }
+    spec = spec_with(backends, workload={"n_prompt": [64], "n_gen": [128], "reps": 3,
+                                         "no_warmup": True})
+    plan = build_plan(spec, make_topology())
+
+    tests = {d.backend: [(w.n_prompt, w.n_gen) for w in ws] for d, ws in plan.groups}
+    assert tests == {"llamacpp": [(64, 0), (0, 128)],
+                     "vllm": [(64, 0), (8192, 0), (0, 128)]}, "n_gen stays global"
+    vllm_ws = next(ws for d, ws in plan.groups if d.backend == "vllm")
+    assert {w.reps for w in vllm_ws} == {3}
+    assert plan.n_online_trials == 5
+    assert plan.fingerprint() != build_plan(spec_with(
+        {**backends, "vllm": {**backends["vllm"], "workload": {"n_prompt": [64]}}},
+        workload={"n_prompt": [64], "n_gen": [128], "reps": 3, "no_warmup": True},
+    ), make_topology()).fingerprint(), "resume must refuse a changed per-backend test list"
+
+
+def test_only_the_test_list_can_be_overridden_per_backend():
+    with pytest.raises(SpecError, match="backends.llamacpp.workload: unknown key"):
+        spec_with({"llamacpp": {"model": "/m", "server_bin": "/b",
+                                "workload": {"reps": 5}}})
+
+
 def test_x_prefixed_top_level_keys_hold_anchors_and_are_ignored():
     spec = spec_with({"llamacpp": {"model": "/m/x.gguf", "server_bin": "/b/llama-server"}},
                      **{"x-shared-env": {"OMP_NUM_THREADS": "32"}})

@@ -197,9 +197,14 @@ class BackendSpec:
     # settings that are not comparable across engines anyway -- llama.cpp's `-c 32000` next
     # to vLLM's `--max-model-len 8192` -- without crossing each value with every backend.
     deployment: dict[str, list[int]] = field(default_factory=dict)
+    # Likewise for the test list: prompt/generation lengths this installation runs instead of
+    # the global `workload:` values -- a long-context model given prompts the others cannot
+    # hold. Reps, warm-up and concurrency stay global, so every row is measured the same way.
+    workload: dict[str, list[int]] = field(default_factory=dict)
 
     _DEFAULT_PORT = {"llamacpp": 8100, "vllm": 8200}
     OVERRIDABLE = ("n_ctx", "n_parallel", "batch", "ubatch", "threads_per_instance")
+    WORKLOAD_OVERRIDABLE = ("n_prompt", "n_gen")
 
     def __post_init__(self) -> None:
         if not self.type:
@@ -210,7 +215,7 @@ class BackendSpec:
         data = data or {}
         _unknown_keys(data, ("type", "model", "served_model_name", "server_bin", "offline_bin",
                              "batched_bin", "extra_args", "offline_extra_args", "env",
-                             "base_port", "deployment"), f"backends.{name}")
+                             "base_port", "deployment", "workload"), f"backends.{name}")
         overrides_in = data.get("deployment") or {}
         if not isinstance(overrides_in, dict):
             raise SpecError(f"backends.{name}.deployment must be a mapping")
@@ -221,6 +226,16 @@ class BackendSpec:
             if any(v < 1 for v in values):
                 raise SpecError(f"backends.{name}.deployment.{key}: every value must be >= 1")
             overrides[key] = values
+        workload_in = data.get("workload") or {}
+        if not isinstance(workload_in, dict):
+            raise SpecError(f"backends.{name}.workload must be a mapping")
+        _unknown_keys(workload_in, cls.WORKLOAD_OVERRIDABLE, f"backends.{name}.workload")
+        workload: dict[str, list[int]] = {}
+        for key, value in workload_in.items():
+            values = _int_axis(value, f"backends.{name}.workload.{key}")
+            if any(v < 0 for v in values):
+                raise SpecError(f"backends.{name}.workload.{key}: every value must be >= 0")
+            workload[key] = values
         if not _BACKEND_NAME.fullmatch(name):
             raise SpecError(f"backends: {name!r} is not a usable name; use letters, digits, "
                             f"'-', '_' and '.' only")
@@ -246,6 +261,7 @@ class BackendSpec:
             env=env,
             base_port=int(data.get("base_port", cls._DEFAULT_PORT.get(kind, 8100))),
             deployment=overrides,
+            workload=workload,
         )
 
     def axis(self, name: str, default: list):

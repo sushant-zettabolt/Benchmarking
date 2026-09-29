@@ -69,7 +69,13 @@ deployment:
   n_ctx: [8192]        # everyone else
 ```
 
-Rows record the value each server was actually launched with. Top-level keys starting with
+Rows record the value each server was actually launched with. The test list works the same
+way: a backend's `workload: {n_prompt: [...], n_gen: [...]}` replaces the global lists for that
+backend only, for instance to give a long-context model prompts the others cannot hold. Reps,
+warm-up and concurrency stay global. Tests only some backends ran get their winner from those
+backends, and the ranking notes that configs covered different numbers of tests.
+
+Top-level keys starting with
 `x-` are ignored, as in docker-compose. They exist to hold YAML anchors shared by several
 backends (`x-llamacpp-env: &env {...}`, then `env: *env`).
 
