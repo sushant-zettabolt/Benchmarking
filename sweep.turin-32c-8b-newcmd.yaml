@@ -1,8 +1,9 @@
 # Variant of sweep.turin-32c-8b.yaml with the user's new server commands (2026-09-29): the same
 # twelve variants (Llama 3.1 8B and Qwen3.6-35B-A3B; ZenDNN llama.cpp, stock llama.cpp and
 # ZenDNN/zentorch vLLM, each at 16-bit and 8-bit weights) and the same tests, plus the long
-# Qwen prompts (see Workload below), but every server is launched with the commands below. Only the model (and its served name, port and,
-# for Qwen on vLLM, --language-model-only) changes between variants of one engine.
+# Qwen prompts (see Workload below), but every server is launched with the commands below.
+# Only the model (and its served name, port and, for Qwen on vLLM, --language-model-only)
+# changes between variants of one engine.
 #
 # ZenDNN llama.cpp, as given by the user:
 #   KMP_AFFINITY=granularity=fine,compact,1,0 KMP_BLOCKTIME=1 KMP_TPAUSE=0
@@ -36,8 +37,15 @@
 # --max-num-batched-tokens from batch, -ub from ubatch, --alias/--served-model-name from
 # served_model_name; the rest is extra_args. `llmbench sweep plan` prints the full commands.
 #
-# Model paths, the libomp.so.5 copy, the LD_LIBRARY_PATH/RUNPATH reasoning and the Qwen weight
-# provenance are as in sweep.turin-32c-8b.yaml; see its header.
+# The Qwen BF16 GGUF is our own copy (2026-09-30, sha256 d748123e...703d685, identical to sacsharm's
+# /proj/rdi/staff/sacsharm/models/gguf/Qwen3.6-35B-A3B-BF16.gguf). llama.cpp mmaps its weights,
+# and --membind=5 does not move page cache that already exists: the shared file was cached
+# mostly on NUMA node 1 by another pod, and the 2026-09-29 full run's
+# qwen36-llamacpp-zendnn-bf16 ran at 0.4-0.6x on those remote pages (loaded in 2 s, not ~80).
+# Only this sweep reads the copy, so its page cache is allocated on node 5.
+#
+# Other model paths, the libomp.so.5 copy, the LD_LIBRARY_PATH/RUNPATH reasoning and the Qwen
+# weight provenance are as in sweep.turin-32c-8b.yaml; see its header.
 #
 # Workload: 3 reps + 1 warm-up, concurrency 1, and tg128 for every variant.
 #   Llama variants: pp1..pp4096 (18 prefill tests), as in sweep.turin-32c-8b.yaml.
@@ -185,7 +193,7 @@ backends:
   # ---------------------------------------------------------- Qwen3.6-35B-A3B
   qwen36-llamacpp-zendnn-bf16:
     type: llamacpp
-    model: /proj/rdi/staff/sacsharm/models/gguf/Qwen3.6-35B-A3B-BF16.gguf
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
     served_model_name: qwen3.6-35b-a3b-bf16
     server_bin: /proj/aigstaff/sohroy/llama.cpp-sacsharm/build_zendnn/bin/llama-server
     base_port: 8300
@@ -207,7 +215,7 @@ backends:
 
   qwen36-llamacpp-bf16:
     type: llamacpp
-    model: /proj/rdi/staff/sacsharm/models/gguf/Qwen3.6-35B-A3B-BF16.gguf
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
     served_model_name: qwen3.6-35b-a3b-bf16
     server_bin: /proj/aigstaff/sohroy/llama.cpp-sacsharm/build/bin/llama-server
     base_port: 8320

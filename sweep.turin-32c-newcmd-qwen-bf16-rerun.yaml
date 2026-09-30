@@ -1,7 +1,8 @@
-# SMOKE TEST for sweep.turin-32c-8b-newcmd.yaml: identical except name, out_dir and the test
-# lists, so every variant starts its server once: pp16 + tg16 for all 12 variants, 1 rep,
-# 1 warm-up, plus pp12288 for the six Qwen variants to check the longest prompt of the full
-# run fits (Qwen vLLM --max-model-len 16384). 30 client rows.
+# RERUN of the two Qwen BF16 llama.cpp variants of sweep.turin-32c-8b-newcmd.yaml, identical
+# except name, out_dir and deployment.backend. In that spec's 2026-09-29 full run,
+# qwen36-llamacpp-zendnn-bf16 mmapped sacsharm's shared GGUF while its page cache sat mostly on
+# NUMA node 1 and ran at 0.4-0.6x. Both variants now read our own copy, in one run, so the
+# ZenDNN vs stock BF16 comparison is not affected by between-run drift. 2 x 25 = 50 trials.
 #
 # Variant of sweep.turin-32c-8b.yaml with the user's new server commands (2026-09-29): the same
 # twelve variants (Llama 3.1 8B and Qwen3.6-35B-A3B; ZenDNN llama.cpp, stock llama.cpp and
@@ -63,8 +64,8 @@
 # every prompt. 6 x 19 + 6 x 25 = 264 trials.
 # Smoke test first: sweep.turin-newcmd-smoke.yaml.
 
-name: turin-newcmd-smoke
-out_dir: out/turin-newcmd-smoke
+name: turin-32c-newcmd-qwen-bf16-rerun
+out_dir: out/turin-32c-newcmd-qwen-bf16-rerun
 mode: online
 
 # ---------------------------------------------------------------- CPU placement
@@ -121,9 +122,10 @@ x-vllm-qwen-deployment: &vllm_qwen_deployment
   n_parallel: 16
   n_ctx: 16384
 
-# Smoke: pp16 plus the full run's longest Qwen prompt.
+# The Qwen variants' prompt list: sweep.turin-32c-qwen36-longctx.yaml's.
 x-qwen-workload: &qwen_workload
-  n_prompt: [16, 12288]
+  n_prompt: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+             5120, 6144, 7168, 8192, 10240, 12288]
 
 x-vllm-args: &vllm_args
   ["--dtype", "bfloat16", "--kv-cache-dtype", "float16", "--distributed-executor-backend", "mp"]
@@ -263,21 +265,18 @@ backends:
 
 # ---------------------------------------------------------------- sweep axes
 deployment:
-  backend: [llama31-llamacpp-zendnn-bf16, llama31-llamacpp-zendnn-q8, llama31-llamacpp-bf16,
-            llama31-llamacpp-q8, llama31-vllm-bf16, llama31-vllm-w8a8,
-            qwen36-llamacpp-zendnn-bf16, qwen36-llamacpp-zendnn-q8, qwen36-llamacpp-bf16,
-            qwen36-llamacpp-q8, qwen36-vllm-bf16, qwen36-vllm-w8a8]
+  backend: [qwen36-llamacpp-zendnn-bf16, qwen36-llamacpp-bf16]
   instances: [1]
   n_parallel: [1]        # llama.cpp -np 1; vLLM overrides to --max-num-seqs 16
   n_ctx: [8192]          # vLLM --max-model-len 8192 (Qwen: 16384); llama.cpp overrides to -c 32000
   batch: [4096]          # llama.cpp -b 4096; vLLM --max-num-batched-tokens 4096
   ubatch: [512]          # llama.cpp -ub 512 (vLLM has no equivalent)
 
-workload:
-  n_prompt: [16]
-  n_gen: [16]
+workload:                # the Qwen variants replace n_prompt (x-qwen-workload)
+  n_prompt: [1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+  n_gen: [128]
   concurrency: [1]
-  reps: 1
+  reps: 3
   warmup_fixed: 1
 
 # ---------------------------------------------------------------- what "best" means
