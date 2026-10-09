@@ -52,6 +52,16 @@ def _as_list(value: Any, key: str) -> list:
     return [value]
 
 
+def _prompt_text(value: Any) -> str:
+    """workload.prompt_text: an existing text file, returned as an absolute path; "" if unset."""
+    if value in (None, ""):
+        return ""
+    path = Path(str(value)).expanduser()
+    if not path.is_file():
+        raise SpecError(f"workload.prompt_text: {value!r} is not a file")
+    return str(path.resolve())
+
+
 def _int_axis(value: Any, key: str, *, default: list[int] | None = None) -> list[int]:
     """Accept 4096, [1,2,4], or llama-bench range syntax "1-16*2"."""
     if value is None:
@@ -337,12 +347,16 @@ class WorkloadAxes:
     # behaviour on purpose -- concurrency above the fleet's slot count otherwise times
     # our own client-side queue rather than the engine.
     force: bool = False
+    # A text file to build prompts from instead of random token ids (prompts.text_prompt_tokens):
+    # MoE expert routing, and so grouped-GEMM speed, differs between language and random ids.
+    # Not an axis. Empty = random ids, the default, and then absent from the plan fingerprint.
+    prompt_text: str = ""
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "WorkloadAxes":
         data = data or {}
         known = ("n_prompt", "n_gen", "pg", "n_depth", "concurrency", "shared_prefix",
-                 "request_rate", "reps", "warmup_fixed", "no_warmup", "force")
+                 "request_rate", "reps", "warmup_fixed", "no_warmup", "force", "prompt_text")
         _unknown_keys(data, known, "workload")
         pg: list[tuple[int, int]] = []
         for item in _as_list(data.get("pg"), "workload.pg"):
@@ -365,6 +379,7 @@ class WorkloadAxes:
             warmup_fixed=(int(data["warmup_fixed"]) if data.get("warmup_fixed") is not None else None),
             no_warmup=bool(data.get("no_warmup", False)),
             force=bool(data.get("force", False)),
+            prompt_text=_prompt_text(data.get("prompt_text")),
         )
 
 

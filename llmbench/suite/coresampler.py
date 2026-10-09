@@ -22,6 +22,20 @@ these cores) = our_cores (the deployment's server processes and their children) 
 harness_cores (this sweep process: the HTTP client and the sampler) + foreign_cores (the rest:
 other users, other pods on the same physical cores).
 
+mhz: the cores' mean effective clock at the end of the row's interval, from cpufreq's
+cpuinfo_avg_freq (the kernel's APERF/MPERF average over its most recent tick; kernel >= 6.15).
+/proc/cpuinfo's "cpu MHz" is useless for this in the Turin pods -- it reads a constant 2102.
+Empty where the file does not exist. end_trial() returns its mean over the measured requests.
+
+Memory columns (same row, sampled at the end of the interval):
+  server_rss_gib   resident memory of the deployment's server processes and their children
+                   (VmRSS) = server_anon_gib (RssAnon: heap, KV cache, repacked weights) +
+                   server_file_gib (RssFile: mmap'd GGUF weights, shared libraries)
+(No pod-level figure: inside the Turin pods /sys/fs/cgroup is not the pod's cgroup -- memory.stat there is host-wide
+and memory.current does not exist -- so the servers' own RSS is the reliable memory measure.)
+Per-NUMA-node residency is not sampled per row (numa_maps of a 66 GB process is too slow at
+250 ms); the deployment's NUMA placement is recorded once at start-up in deployments.json.
+
 Resolution: /proc/stat counts in clock ticks (10 ms on x86 Linux), so at the default 250 ms
 a single core's busy % moves in steps of about 4%. Aggregates over many cores are finer.
 """
@@ -67,6 +81,48 @@ def _read_cpu_fields(cpus: set[int]) -> dict[int, tuple[int, ...]]:
     return out
 
 
+def _read_avg_mhz(cpus: Iterable[int]) -> float | None:
+    """Mean effective clock of `cpus` in MHz (cpuinfo_avg_freq, kHz), None if unavailable."""
+    vals = []
+    for cpu in cpus:
+        try:
+            vals.append(int(Path(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_avg_freq").read_text()))
+        except (OSError, ValueError):
+            continue
+    return sum(vals) / len(vals) / 1000.0 if vals else None
+
+
+_GIB = 1024 ** 3
+
+
+def _read_proc_rss(pids: Iterable[int]) -> tuple[float, float, float] | None:
+    """(rss, anon, file) in GiB summed over `pids` from /proc/<pid>/status, None if none readable."""
+    total = anon = file = 0
+    seen = False
+    for pid in pids:
+        try:
+            text = Path(f"/proc/{pid}/status").read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            key, _, rest = line.partition(":")
+            if key in ("VmRSS", "RssAnon", "RssFile"):
+                try:
+                    kib = int(rest.split()[0])
+                except (ValueError, IndexError):
+                    continue
+                if key == "VmRSS":
+                    total += kib
+                    seen = True
+                elif key == "RssAnon":
+                    anon += kib
+                else:
+                    file += kib
+    if not seen:
+        return None
+    return total * 1024 / _GIB, anon * 1024 / _GIB, file * 1024 / _GIB
+
+
 class CoreSampler:
     """Samples a cpu set in a background thread and writes labelled rows to a CSV file.
 
@@ -110,13 +166,19 @@ class CoreSampler:
         with self._lock:
             self._label = (trial_id, test)
 
-    def end_trial(self, rep_windows: list[tuple[int, int, int]]) -> None:
+    def end_trial(self, rep_windows: list[tuple[int, int, int]]) -> float | None:
         """rep_windows: (rep_idx, t_send_ns, t_end_ns) of each measured request, on the
-        time.perf_counter_ns clock the runner stamps its records with."""
+        time.perf_counter_ns clock the runner stamps its records with.
+
+        Returns the cores' mean clock (MHz) over the rows inside measured requests, or None."""
         with self._lock:
             rows, self._buf = self._buf, []
+            trial_id = self._label[0]
             self._label = ("", "")
         self._write(rows, rep_windows=rep_windows)
+        mhz = [r["mhz"] for r in rows if r.get("mhz") is not None and
+               self._phase((r["t0_ns"] + r["t1_ns"]) // 2, trial_id, rep_windows).startswith("rep")]
+        return sum(mhz) / len(mhz) if mhz else None
 
     # -- sampling thread --
 
@@ -135,6 +197,8 @@ class CoreSampler:
             ours, mine = self._our_ticks(), _process_cpu_ticks(me)
             row = self._row(prev, cur, prev_t, now_t, ours - prev_ours, mine - prev_mine)
             if row is not None:
+                rss = _read_proc_rss(p for pid in self.pids for p in _descendant_pids(pid))
+                row["server_rss_gib"], row["server_anon_gib"], row["server_file_gib"] = rss or (None, None, None)
                 with self._lock:
                     row["trial"], row["test"] = self._label
                     self._buf.append(row)
@@ -186,6 +250,7 @@ class CoreSampler:
             "our_cores": our_cores,
             "harness_cores": harness_cores,
             "foreign_cores": max(0.0, busy_cores - our_cores - harness_cores),
+            "mhz": _read_avg_mhz(self.cpus),
             "per_cpu": per_cpu,
         }
 
@@ -218,7 +283,8 @@ class CoreSampler:
             if new:
                 w.writerow(["ts_utc", "t_s", "interval_s", "trial", "test", "phase",
                             "busy_pct", "user_pct", "system_pct", "iowait_pct", "irq_pct",
-                            "steal_pct", "busy_cores", "our_cores", "harness_cores", "foreign_cores"]
+                            "steal_pct", "busy_cores", "our_cores", "harness_cores", "foreign_cores",
+                            "mhz", "server_rss_gib", "server_anon_gib", "server_file_gib"]
                            + [f"cpu{c}" for c in self.cpus])
             for r in rows:
                 mid = (r["t0_ns"] + r["t1_ns"]) // 2
@@ -230,6 +296,9 @@ class CoreSampler:
                                              "iowait_pct", "irq_pct", "steal_pct")]
                     + [_r(r[k], 2) for k in ("busy_cores", "our_cores", "harness_cores",
                                              "foreign_cores")]
+                    + [_r(r.get("mhz"), 0)]
+                    + [_r(r.get(k), 2) for k in ("server_rss_gib", "server_anon_gib",
+                                                 "server_file_gib")]
                     + [_r(r["per_cpu"].get(c), 1) for c in self.cpus]
                 )
         self.n_rows += len(rows)

@@ -219,6 +219,7 @@ class Instance:
     n_prompt: int = 0
     n_gen: int = 0
     is_pg: bool = False
+    prompt_text: str = ""  # path of a text file: prompts are real text (prompts.text_prompt_tokens)
 
     def test_name(self) -> str:
         if self.is_pg:

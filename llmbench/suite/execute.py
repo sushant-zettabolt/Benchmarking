@@ -34,7 +34,7 @@ from ..runner import CapacityError, run_instance
 from . import procs
 from .contention import ContentionMonitor
 from .coresampler import CoreSampler
-from .deploy import CapacityFailure, DeploymentError, launch_deployment
+from .deploy import MEMORY_LOCAL_MIN_FRACTION, CapacityFailure, DeploymentError, launch_deployment
 from .hostinfo import capture_host, capture_software
 from .lb import make_backend
 from .lb.fanout import FanoutBackend
@@ -504,6 +504,7 @@ class SweepRunner:
             n_parallel=dep.n_parallel, n_ctx=dep.n_ctx,
             n_depth=w.n_depth, concurrency=w.concurrency, shared_prefix=w.shared_prefix,
             n_prompt=w.n_prompt, n_gen=w.n_gen, is_pg=w.is_pg,
+            prompt_text=self.spec.workload.prompt_text,
         )
 
     async def _run_deployment(self, dep: DeploymentPlan, workloads: list[WorkloadPlan]) -> None:
@@ -555,6 +556,9 @@ class SweepRunner:
                     "message": f"{len(unverified)} instance(s) could not be read from /proc; "
                                f"placement unverified (see deployments.json)",
                 })
+            remote = [m for m in live.memory if m.get("error")]
+            if remote:
+                self._event("warning", {"deployment": dep.id, "message": remote[0]["error"]})
 
             if self.spec.core_sample_interval_s > 0:
                 self._sampler = CoreSampler(
@@ -669,9 +673,10 @@ class SweepRunner:
                 raise
             return
         finally:
+            clock_mhz = None
             if self._sampler is not None:
-                self._sampler.end_trial([(r.rep_idx, r.t_send_ns, r.t_end_ns) for r in records
-                                         if r.t_send_ns and r.t_end_ns])
+                clock_mhz = self._sampler.end_trial([(r.rep_idx, r.t_send_ns, r.t_end_ns) for r in records
+                                                     if r.t_send_ns and r.t_end_ns])
 
         raw = [r.to_dict() for r in records]
         duration = time.monotonic() - t0
@@ -704,12 +709,23 @@ class SweepRunner:
             "verified": all(a.get("verified") for a in live.affinity),
             "threads_on_other_cpus": stray,
         }
+        # Share of the servers' resident memory on their bound NUMA nodes, worst instance first
+        # (verify_memory_placement): pinned threads reading remote weights are just as wrong.
+        local = [m["local_fraction"] for m in live.memory if "local_fraction" in m]
+        if local:
+            placement["memory_local_fraction"] = min(local)
         placement_warning = None
         if stray:
             placement_warning = (
                 f"{stray} server thread(s) were pinned outside this deployment's allocation; "
                 f"it was not core-isolated and these numbers should not be compared against "
                 f"correctly placed ones"
+            )
+        elif local and min(local) < MEMORY_LOCAL_MIN_FRACTION:
+            placement_warning = (
+                f"only {100 * min(local):.0f}% of a server's memory was on its bound NUMA node(s); "
+                f"its weights were read across the socket interconnect and these numbers should "
+                f"not be compared against local ones (deployments.json, live.memory)"
             )
 
         provenance = {
@@ -724,6 +740,9 @@ class SweepRunner:
             "records_file": f"records/{dep.id}.jsonl",
             "core_timeseries": (str(self._sampler.path.relative_to(self.out_dir))
                                 if self._sampler is not None else None),
+            # mean effective clock of the deployment's cores during the measured requests
+            # (cpuinfo_avg_freq); explains run-to-run drift that pinning and contention do not
+            "clock_mhz": round(clock_mhz) if clock_mhz is not None else None,
             # The exact command each server of this deployment was started with: argv (numactl
             # prefix included) and the environment variables set on top of the sweep's own.
             "server_commands": [

@@ -69,6 +69,48 @@ def generate_prompt_tokens(
     return tokens[:n_prompt]
 
 
+def text_prompt_tokens(
+    *,
+    n_prompt: int,
+    text_ids: list[int],
+    shared_prefix_n: int,
+    run_salt: int,
+    request_idx: int,
+    vocab_size: int,
+    bos_token_id: int | None = None,
+) -> list[int]:
+    """Like generate_prompt_tokens, but the filler is real text (workload.prompt_text).
+
+    Random token ids route an MoE model's tokens to experts very differently from language
+    (on Qwen3.6 some experts got 80 of a ubatch's rows and others 1), and grouped-GEMM speed
+    depends on that spread. Layout: [BOS] [shared prefix: the text's first tokens] [2 salt
+    tokens, unique per request, as in generate_prompt_tokens] [the text from a per-request
+    offset, wrapping]. `text_ids` is the tokenized text.
+    """
+    if n_prompt <= 0:
+        return []
+    if not text_ids:
+        raise ValueError("text_prompt_tokens: empty text")
+    tokens: list[int] = []
+    remaining = n_prompt
+    if bos_token_id is not None:
+        tokens.append(bos_token_id)
+        remaining -= 1
+    if shared_prefix_n > 0 and remaining > 0:
+        shared_n = min(shared_prefix_n, remaining)
+        tokens.extend(text_ids[i % len(text_ids)] for i in range(shared_n))
+        remaining -= shared_n
+    if remaining > 0:
+        marker = [_salt_token(run_salt, vocab_size), _salt_token(request_idx, vocab_size)]
+        marker_n = min(2, remaining)
+        tokens.extend(marker[:marker_n])
+        remaining -= marker_n
+    if remaining > 0:
+        off = (request_idx * 7919) % len(text_ids)
+        tokens.extend(text_ids[(off + i) % len(text_ids)] for i in range(remaining))
+    return tokens[:n_prompt]
+
+
 def generate_depth_prefix_tokens(
     *, n_depth: int, run_salt: int, request_idx: int, vocab_size: int, rng: random.Random,
 ) -> list[int]:

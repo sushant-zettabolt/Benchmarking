@@ -1,0 +1,205 @@
+# ZenDNN llama.cpp build matrix on Qwen3.6-35B-A3B BF16, prefill only (pp2048, pp4096), with per-trial CPU and RAM.
+# Requested 2026-10-08. 9 variants, all single-instance llama-server on one pod's 32 cores (turin-xcovoid0023-pod-6:
+# cpus 192-223, memory node 6), concurrency 1, -b 4096 -ub 4096, server command = command B of docs/turin-optimised-commands-2026-09-30.md, except -ub 4096.
+#
+# Builds (built by /proj/aigstaff/sohroy/llama.cpp-matrix/build_matrix.sh, each in its own dir; no existing build is touched):
+#   nozen            upstream llama.cpp 78651c4, no ZenDNN
+#   zen_ww28         78651c4 + ZenDNN-2026-WW28 (the tag llama.cpp's CMake pins, built from source by it)
+#   zen_ww28_nolimit f012f20 (= 78651c4 + removal of ggml-zendnn's MUL_MAT_ID 32-expert / rows-per-expert limits) + WW28
+#   zen_latest         78651c4 + ZenDNN v6.1.0_rc3 (= zendnn-2026-WW40, e3f4c4dd)
+#   zen_latest_nolimit f012f20 + v6.1.0_rc3
+# No CONCAT fix in any build (so the single-threaded GDN conv CONCAT is present in all, as in the original problem).
+#
+# Each ZenDNN build runs twice: ZENDNNL_GRP_MATMUL_ALGO=1 (pinned scheduler) and with it unset (ZenDNN's AUTO scheduler).
+# ZENDNNL_MATMUL_ALGO=1 is kept in both, as in the existing "optimised" ZenDNN command.
+#
+# Command B of the optimised-commands doc, except -ub 4096 AND -lm dio (O_DIRECT load into the server's own memory).
+# Why -lm dio: with command B's default mmap, the ZenDNN v6.1.0_rc3 builds die with SIGSEGV ~3 s after the first request
+# (exit 139, reproduced with llama-bench; the same builds run with -lm dio; ZenDNN WW28 and the CPU build run with mmap).
+# A first mmap run of all 9 variants is kept in out/turin-zendnn-matrix (5 ok, the 4 latest variants errored).
+# With dio all weights are private memory: server_anon_gib is the real footprint, server_file_gib ~0, and the page cache
+# cannot sit on a remote NUMA node.
+# Without the limit removal, MUL_MAT_ID stays on the CPU for Qwen's 256 experts; with ALGO unset ZenDNN needs several
+# passes to reach steady state (extra weight packs), hence warmup_fixed 3 and per-rep results in report_reps.csv.
+#
+# CPU/RAM: cores/<deployment>.csv (250 ms): per-core busy %, busy/our/foreign cores, MHz, server_rss/anon/file GiB, cgroup_mem GiB.
+# Summarise with: scripts/summarize_cpu_ram.py out/turin-zendnn-matrix-dio
+
+name: turin-zendnn-matrix-dio
+out_dir: out/turin-zendnn-matrix-dio
+mode: online
+
+cpu:
+  budget: "192-223"
+  smt: exclude
+  ccd_align: true
+  membind: "6"
+  numa_policy: membind
+
+lb:
+  kind: client
+
+x-llamacpp-env: &llamacpp_env
+  LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/proj/rdi/staff/sohroy/lib/libomp.so.5
+  KMP_AFFINITY: granularity=fine,compact,1,0
+  KMP_BLOCKTIME: "1"
+  KMP_TPAUSE: "0"
+  KMP_FORKJOIN_BARRIER_PATTERN: dist,dist
+  KMP_PLAIN_BARRIER_PATTERN: dist,dist
+  KMP_REDUCTION_BARRIER_PATTERN: dist,dist
+  OMP_NUM_THREADS: "32"
+  OMP_DYNAMIC: "FALSE"
+  OMP_WAIT_POLICY: ACTIVE
+
+x-llamacpp-deployment: &llamacpp_deployment
+  n_ctx: 32000
+
+x-llamacpp-args: &llamacpp_args ["-fa", "on", "-ctk", "f16", "-ctv", "f16", "-lm", "dio"]
+
+backends:
+
+  qwen36-cpu-nozen:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_nozen/bin/llama-server
+    base_port: 8500
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_nozen/bin
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-ww28-algo1:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/bin/llama-server
+    base_port: 8510
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/bin:/proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/_deps/zendnn-prefix/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+      ZENDNNL_GRP_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-ww28-algounset:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/bin/llama-server
+    base_port: 8520
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/bin:/proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/_deps/zendnn-prefix/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-ww28-nolimit-algo1:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28_nolimit/bin/llama-server
+    base_port: 8530
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28_nolimit/bin:/proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/_deps/zendnn-prefix/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+      ZENDNNL_GRP_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-ww28-nolimit-algounset:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28_nolimit/bin/llama-server
+    base_port: 8540
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28_nolimit/bin:/proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_ww28/_deps/zendnn-prefix/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-latest-algo1:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest/bin/llama-server
+    base_port: 8550
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest/bin:/proj/aigstaff/sohroy/ZenDNN-latest/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+      ZENDNNL_GRP_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-latest-algounset:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest/bin/llama-server
+    base_port: 8560
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest/bin:/proj/aigstaff/sohroy/ZenDNN-latest/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-latest-nolimit-algo1:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest_nolimit/bin/llama-server
+    base_port: 8570
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest_nolimit/bin:/proj/aigstaff/sohroy/ZenDNN-latest/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+      ZENDNNL_GRP_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+  qwen36-zen-latest-nolimit-algounset:
+    type: llamacpp
+    model: /proj/rdi/staff/sohroy/models/Qwen3.6-35B-A3B-BF16.gguf
+    served_model_name: qwen3.6-35b-a3b-bf16
+    server_bin: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest_nolimit/bin/llama-server
+    base_port: 8580
+    extra_args: *llamacpp_args
+    env:
+      <<: *llamacpp_env
+      LD_LIBRARY_PATH: /proj/aigstaff/sohroy/llama.cpp-matrix/build_zen_latest_nolimit/bin:/proj/aigstaff/sohroy/ZenDNN-latest/build/install/zendnnl/lib
+      ZENDNNL_MATMUL_ALGO: "1"
+    deployment: *llamacpp_deployment
+
+deployment:
+  backend: [qwen36-cpu-nozen, qwen36-zen-ww28-algo1, qwen36-zen-ww28-algounset, qwen36-zen-ww28-nolimit-algo1, qwen36-zen-ww28-nolimit-algounset, qwen36-zen-latest-algo1, qwen36-zen-latest-algounset, qwen36-zen-latest-nolimit-algo1, qwen36-zen-latest-nolimit-algounset]
+  instances: [1]
+  n_parallel: [1]
+  n_ctx: [32000]
+  batch: [4096]
+  ubatch: [4096]         # -ub 4096 for all variants (the optimised command B uses 512)
+
+workload:
+  n_prompt: [2048, 4096]
+  n_gen: [0]             # prefill only (pp tests, no decode)
+  concurrency: [1]
+  reps: 5
+  warmup_fixed: 3
+
+objective:
+  metric: tps_mean
+  goal: max
+  src: client
+
+startup_timeout_s: 3600  # 67 GB BF16 GGUF read with O_DIRECT over NFS
+request_timeout_s: 3600  # ZenDNN v6.1.0_rc3's first pass packs every expert's weights (pp256 alone took ~400 s)
+settle_s: 10
+continue_on_error: true
+core_sample_interval_s: 0.25

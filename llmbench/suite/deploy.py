@@ -479,6 +479,83 @@ def verify_affinity(mp: ManagedProcess) -> dict[str, Any]:
     return out
 
 
+# A deployment whose resident memory sits less than this fraction on its bound NUMA nodes is
+# reading weights across the interconnect. Measured on Turin (2026-09-29): an mmap'd Qwen3.6 GGUF
+# whose page cache another pod had left on the other socket ran llama.cpp prefill at 0.55x.
+MEMORY_LOCAL_MIN_FRACTION = 0.9
+
+
+def _numa_resident_kb(pid: int) -> dict[int, int]:
+    """Resident kB per NUMA node over every mapping of a process."""
+    try:
+        return parse_numa_maps(Path(f"/proc/{pid}/numa_maps").read_text())
+    except OSError:
+        return {}
+
+
+def parse_numa_maps(text: str) -> dict[int, int]:
+    """Resident kB per NUMA node from /proc/<pid>/numa_maps text: every mapping's N<node>=<pages>
+    counts, times that mapping's kernelpagesize_kB (4 unless stated, e.g. 2048 for huge pages)."""
+    per_node: dict[int, int] = {}
+    for line in text.splitlines():
+        page_kb = 4
+        counts = []
+        for tok in line.split()[2:]:
+            if tok.startswith("kernelpagesize_kB="):
+                page_kb = int(tok.split("=", 1)[1])
+            elif tok[0] == "N" and "=" in tok:
+                node, n = tok[1:].split("=", 1)
+                if node.isdigit() and n.isdigit():
+                    counts.append((int(node), int(n)))
+        for node, n in counts:
+            per_node[node] = per_node.get(node, 0) + n * page_kb
+    return per_node
+
+
+def verify_memory_placement(mp: ManagedProcess) -> dict[str, Any]:
+    """Where a server's memory actually is, per NUMA node, against the nodes it was bound to.
+
+    `numactl --membind` only governs pages the server allocates itself. An mmap'd model runs from
+    the host-wide page cache, which stays on whatever node first read the file -- possibly
+    another pod's, on the other socket -- and --membind does not move it. So a server can be
+    pinned perfectly (verify_affinity) and still read every weight remotely. Summed over the
+    server and its children (vLLM keeps the weights in its worker process).
+    """
+    if not mp.alive or mp.cores is None:
+        return {"verified": False, "reason": "process not running or unpinned"}
+    from .contention import _descendant_pids
+
+    per_node: dict[int, int] = {}
+    for pid in _descendant_pids(mp.pid):
+        for node, kb in _numa_resident_kb(pid).items():
+            per_node[node] = per_node.get(node, 0) + kb
+    total = sum(per_node.values())
+    bound = list(mp.cores.membind)
+    out: dict[str, Any] = {
+        "membind": bound,
+        "resident_gb": round(total / 1048576, 1),
+        "per_node_gb": {str(n): round(kb / 1048576, 1) for n, kb in sorted(per_node.items())},
+    }
+    if not total:
+        out.update(verified=False, reason=f"no numa_maps readable for pid {mp.pid}")
+        return out
+    if not bound:
+        out.update(verified=True, reason="no membind requested")
+        return out
+    local = sum(kb for n, kb in per_node.items() if n in bound) / total
+    out["local_fraction"] = round(local, 3)
+    out["verified"] = local >= MEMORY_LOCAL_MIN_FRACTION
+    if not out["verified"]:
+        remote = {n: round(kb / 1048576, 1) for n, kb in per_node.items() if n not in bound and kb}
+        out["error"] = (
+            f"only {100 * local:.0f}% of the server's {total / 1048576:.0f} GB resident memory is on "
+            f"its bound node(s) {bound}; {remote} GB on other nodes. An mmap'd model's page cache "
+            f"stays where the first reader left it; load with --load-mode none/dio, or drop the "
+            f"file from the page cache, to measure with local weights"
+        )
+    return out
+
+
 @dataclass
 class LiveDeployment:
     """A running fleet. Always use as an async context manager so teardown is guaranteed."""
@@ -487,6 +564,7 @@ class LiveDeployment:
     processes: list[ManagedProcess] = field(default_factory=list)
     lb_process: ManagedProcess | None = None
     affinity: list[dict[str, Any]] = field(default_factory=list)
+    memory: list[dict[str, Any]] = field(default_factory=list)
     started_at_utc: str = ""
     launch_seconds: float = 0.0
 
@@ -502,6 +580,7 @@ class LiveDeployment:
             "processes": [p.to_dict() for p in self.processes],
             "lb_process": self.lb_process.to_dict() if self.lb_process else None,
             "affinity": self.affinity,
+            "memory": self.memory,
         }
 
     async def teardown(self, *, settle_s: float = 3.0, port_timeout_s: float = 30.0) -> list[str]:
@@ -577,6 +656,7 @@ async def launch_deployment(
         ))
 
         live.affinity = [verify_affinity(mp) for mp in live.processes]
+        live.memory = [verify_memory_placement(mp) for mp in live.processes]
 
         if dep.lb_kind == "nginx":
             live.lb_process = await start_load_balancer(dep, spec, out_dir=out_dir)
@@ -590,6 +670,6 @@ async def launch_deployment(
 
 __all__ = [
     "LiveDeployment", "ManagedProcess", "launch_deployment", "build_server_command",
-    "numactl_prefix", "verify_affinity", "assert_ports_free", "port_is_free",
+    "numactl_prefix", "verify_affinity", "verify_memory_placement", "assert_ports_free", "port_is_free",
     "terminate_process_group", "DeploymentError", "CapacityFailure", "PortInUseError",
 ]

@@ -252,6 +252,8 @@ backends:
       KMP_AFFINITY: granularity=fine,compact,1,0
       OMP_NUM_THREADS: '32'
       ZENDNNL_MATMUL_ALGO: '1'
+    deployment:
+      n_ctx: [32000]
   llama31-llamacpp-zendnn-q8-t16:
     type: llamacpp
     model: /proj/rdi/staff/sohroy/models/Llama-3.1-8B-Instruct-Q8_0.gguf

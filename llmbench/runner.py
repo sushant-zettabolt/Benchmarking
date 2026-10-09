@@ -17,7 +17,7 @@ from .arrivals import generate_arrival_delays
 from .backends.base import Backend
 from .backends.vllm import METRIC_PREEMPTIONS_TOTAL
 from .config import CmdParams, Instance
-from .prompts import generate_depth_prefix_tokens, generate_prompt_tokens
+from .prompts import generate_depth_prefix_tokens, generate_prompt_tokens, text_prompt_tokens
 from .records import RawRecord
 
 
@@ -204,6 +204,16 @@ async def run_instance(
     instance_id = str(uuid.uuid4())
     rng = random.Random(run_salt)
     request_counter = [0]
+    text_ids: list[int] = []
+    if instance.prompt_text:
+        # tokenized by the server under test, so the ids are that model's own
+        from pathlib import Path
+
+        text_ids = await backend.tokenize(Path(instance.prompt_text).read_text())
+        if bos_token_id is not None and text_ids[:1] == [bos_token_id]:
+            text_ids = text_ids[1:]
+        if not text_ids:
+            raise ValueError(f"prompt_text {instance.prompt_text}: tokenized to nothing")
 
     def next_prompt_tokens() -> list[int]:
         request_counter[0] += 1
@@ -213,6 +223,11 @@ async def run_instance(
         # stays 0 (preserves the tg{n} test label); n_prompt_actual reflects what was really
         # sent (found live against llama-server: empty "prompt": [] -> HTTP 400).
         effective_n_prompt = instance.n_prompt if instance.n_prompt > 0 else 1
+        if text_ids:
+            return text_prompt_tokens(
+                n_prompt=effective_n_prompt, text_ids=text_ids, shared_prefix_n=instance.shared_prefix,
+                run_salt=run_salt, request_idx=idx, vocab_size=vocab_size, bos_token_id=bos_token_id,
+            ), idx
         return generate_prompt_tokens(
             n_prompt=effective_n_prompt, shared_prefix_n=instance.shared_prefix,
             run_salt=run_salt, request_idx=idx, vocab_size=vocab_size, rng=rng,

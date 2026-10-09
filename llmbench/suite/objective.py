@@ -27,6 +27,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from .deploy import MEMORY_LOCAL_MIN_FRACTION
 from .execute import CONTENTION_WARN_PCT, STATUS_OK, TrialResult
 from .spec import Constraint, ObjectiveSpec
 
@@ -140,6 +141,9 @@ def quality_issues(r: TrialResult, objective: ObjectiveSpec) -> list[str]:
     stray = (prov.get("placement") or {}).get("threads_on_other_cpus")
     if stray:
         issues.append(f"{stray} server thread(s) pinned outside the allocation")
+    local = (prov.get("placement") or {}).get("memory_local_fraction")
+    if isinstance(local, (int, float)) and local < MEMORY_LOCAL_MIN_FRACTION:
+        issues.append(f"only {100 * local:.0f}% of server memory on its bound NUMA node(s)")
     n_records, n_errors = prov.get("n_records"), prov.get("n_errors")
     if n_records and n_errors:
         pct = 100.0 * n_errors / n_records

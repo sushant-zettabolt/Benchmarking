@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -241,7 +242,7 @@ class SweepPlan:
         body = {
             "plan": plan,
             "backends": {k: dataclasses.asdict(v) for k, v in sorted(s.backends.items())},
-            "workload": dataclasses.asdict(s.workload),
+            "workload": _workload_fingerprint(s.workload),
             "offline": dataclasses.asdict(s.offline),
             "cpu": dataclasses.asdict(s.cpu),
             "lb": dataclasses.asdict(s.lb),
@@ -250,6 +251,16 @@ class SweepPlan:
         }
         blob = json.dumps(body, sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _workload_fingerprint(workload) -> dict:
+    """The workload as fingerprinted: prompt_text by content, and left out when unset, so
+    plans written before the field existed keep their fingerprint (and --resume keeps working)."""
+    wl = dataclasses.asdict(workload)
+    text = wl.pop("prompt_text", "")
+    if text:
+        wl["prompt_text_sha256"] = hashlib.sha256(Path(text).read_bytes()).hexdigest()
+    return wl
 
 
 def _cartesian(axes: list[list]) -> Iterator[tuple]:

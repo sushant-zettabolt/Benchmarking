@@ -12,7 +12,8 @@ from typing import Any, Iterable
 
 from ..execute import STATUS_OK, TrialResult
 
-# (column header, source, key). source: "top" = TrialResult attr, "axis", "metric".
+# (column header, source, key). source: "top" = TrialResult attr, "axis", "metric", "prov"
+# (provenance; a dotted key descends into nested dicts).
 COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("status", "top", "status"),
     ("kind", "top", "kind"),
@@ -49,6 +50,10 @@ COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("e2e p50", "metric", "e2e_ms_mean"),
     ("overhead ms", "metric", "overhead_ms_mean"),
     ("reps", "metric", "n_reps_valid"),
+    # measurement conditions: the cores' mean clock during the measured requests, and the share
+    # of the servers' memory on their bound NUMA node(s) (see deploy.verify_memory_placement)
+    ("MHz", "prov", "clock_mhz"),
+    ("mem local", "prov", "placement.memory_local_fraction"),
     ("trial", "top", "trial_id"),
     ("error", "top", "error"),
 )
@@ -65,6 +70,11 @@ def cell(result: TrialResult, source: str, key: str) -> Any:
         return getattr(result, key, None)
     if source == "axis":
         return result.axes.get(key)
+    if source == "prov":
+        value: Any = result.provenance or {}
+        for part in key.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        return value
     return result.metrics.get(key)
 
 

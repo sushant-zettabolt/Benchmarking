@@ -115,3 +115,24 @@ def test_the_sampler_can_be_turned_off(tmp_path, monkeypatch):
 
     assert FakeSampler.instances == []
     assert runner.results[0].provenance["core_timeseries"] is None
+
+
+def test_rows_carry_server_rss_memory(tmp_path):
+    cpus = sorted(os.sched_getaffinity(0))[:2]
+    path = tmp_path / "cores" / "d000.csv"
+    ballast = bytearray(64 * 1024 * 1024)            # 64 MiB resident (touched) anonymous memory
+    for i in range(0, len(ballast), 4096):
+        ballast[i] = 1
+    s = CoreSampler(cpus, pids=[os.getpid()], path=path, interval_s=0.05)
+    s.start()
+    time.sleep(0.3)
+    s.stop()
+    rows = list(csv.DictReader(path.open()))
+    assert rows
+    for col in ("server_rss_gib", "server_anon_gib", "server_file_gib"):
+        assert col in rows[0]
+    rss = [float(r["server_rss_gib"]) for r in rows if r["server_rss_gib"]]
+    anon = [float(r["server_anon_gib"]) for r in rows if r["server_anon_gib"]]
+    assert rss and min(rss) >= 64 / 1024              # at least the ballast
+    assert anon and max(anon) <= max(rss) + 1e-6 and min(anon) >= 64 / 1024 - 0.01
+    assert len(ballast) == 64 * 1024 * 1024
